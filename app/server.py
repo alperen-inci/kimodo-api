@@ -4,7 +4,7 @@
 
 Endpoints:
     GET  /health              — Service health and model status
-    POST /generate/timeline   — Generate motion from a timeline specification
+    POST /generate/kimodo   — Generate motion from a timeline specification
 """
 
 from __future__ import annotations
@@ -86,9 +86,9 @@ async def health():
 
 
 # ---------------------------------------------------------------------------
-# /generate/timeline
+# /generate/kimodo
 # ---------------------------------------------------------------------------
-@app.post("/generate/timeline")
+@app.post("/generate/kimodo")
 async def generate_timeline(
     request: Request,
     spec_json: str = Form(..., description="JSON timeline specification"),
@@ -103,7 +103,7 @@ async def generate_timeline(
     Returns a raw ``.npz`` file as ``application/octet-stream``.
     """
     req_id = uuid.uuid4().hex[:8]
-    log.info("[%s] /generate/timeline — received request (%d file(s))", req_id, len(files))
+    log.info("[%s] /generate/kimodo — received request (%d file(s))", req_id, len(files))
 
     # ---- Parse spec ----
     try:
