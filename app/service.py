@@ -204,15 +204,26 @@ class KimodoService:
                     else:
                         output[key] = val[num_over:]
 
-            # Prepend history's last frame so Unreal bake has no jump
+            # Prepend history's last frame so Unreal bake has no jump.
+            # Only prepend to the keys used by _export_npz: local_rot_mats, root_positions
             history_last_frame = history_info.get("last_frame")
             if history_last_frame:
                 log.info("  Prepending history last frame to output")
-                for key in output:
-                    val = output[key]
-                    hf = history_last_frame.get(key)
-                    if hf is not None and hasattr(val, "shape") and val.ndim >= 2:
-                        output[key] = np.concatenate([hf, val], axis=-3 if val.ndim >= 3 else 0)
+                for key in ("local_rot_mats", "root_positions"):
+                    if key in output and key in history_last_frame:
+                        val = output[key]
+                        hf = history_last_frame[key]  # (1, ...) — single frame, no batch
+                        log.info("    key=%s val.shape=%s hf.shape=%s", key, val.shape, hf.shape)
+                        # val: (B, T, ...) or (T, ...) after trim
+                        # hf: (1, ...) — single frame without batch
+                        # We need to concat along the time axis (axis 1 for batched, axis 0 for unbatched)
+                        if val.ndim == hf.ndim:
+                            # Both same ndim: concat on axis 0 (time)
+                            output[key] = np.concatenate([hf, val], axis=0)
+                        elif val.ndim == hf.ndim + 1:
+                            # val has batch dim, hf doesn't: add batch dim to hf
+                            output[key] = np.concatenate([hf[np.newaxis], val], axis=1)
+                        log.info("    result shape=%s", output[key].shape)
 
         # ---- Export to NPZ ----
         npz_bytes = self._export_npz(output, return_format=return_format)
