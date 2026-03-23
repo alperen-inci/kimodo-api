@@ -1,0 +1,85 @@
+# Kimodo API docker-compose.
+#
+# Services:
+#   text-encoder  — Gradio text embedding service (port 9550)
+#   kimodo-api    — FastAPI motion generation (port 8020)
+#
+# Usage:
+#   cd kimodo/         # repo root
+#   docker compose -f kimodo-api/docker-compose.yaml up
+#
+# The text-encoder must be healthy before kimodo-api starts.
+
+services:
+  text-encoder:
+    image: kimodo:1.0
+    container_name: kimodo-text-encoder
+    working_dir: /workspace
+    command: python -m kimodo.scripts.run_text_encoder_server
+    volumes:
+      - ../:/workspace
+      - ${HOME}/.cache/huggingface:/workspace/.cache/huggingface
+      - ${HOME}/.cache/huggingface/token:/workspace/.cache/huggingface/token:ro
+    ports:
+      - "9550:9550"
+    environment:
+      - HF_HOME=/workspace/.cache/huggingface
+      - HOST_USER=${USER:-user}
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    shm_size: "16gb"
+    ipc: host
+    healthcheck:
+      test:
+        ["CMD", "bash", "-lc", "curl -fsS http://localhost:9550/ > /dev/null"]
+      interval: 3s
+      timeout: 2s
+      retries: 40
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  kimodo-api:
+    build:
+      context: ..
+      dockerfile: kimodo-api/Dockerfile
+    image: kimodo-api:latest
+    container_name: kimodo-api
+    working_dir: /workspace/kimodo-api
+    command: >
+      python -m uvicorn app.server:app
+      --host 0.0.0.0
+      --port 8020
+    volumes:
+      - ../:/workspace
+      - ${HOME}/.cache/huggingface:/workspace/.cache/huggingface
+      - ${HOME}/.cache/huggingface/token:/workspace/.cache/huggingface/token:ro
+    ports:
+      - "${KIMODO_API_PORT:-8020}:8020"
+    environment:
+      - TEXT_ENCODER_URL=http://text-encoder:9550/
+      - TEXT_ENCODER_MODE=api
+      - HF_HOME=/workspace/.cache/huggingface
+      - KIMODO_MODEL=${KIMODO_MODEL:-smplx}
+      - KIMODO_DEVICE=cuda
+      - KIMODO_API_PORT=8020
+      - KIMODO_API_LOG_LEVEL=INFO
+      - HOST_USER=${USER:-user}
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    shm_size: "16gb"
+    ipc: host
+    depends_on:
+      text-encoder:
+        condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
