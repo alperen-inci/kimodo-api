@@ -167,6 +167,7 @@ async def generate_timeline(
                     "num_over_generate": history_result["num_over_generate"],
                     "heading_angle": history_result["heading_angle"],
                     "root_origin_2d_yup": history_result["root_origin_2d_yup"],
+                    "last_frame": history_result["last_frame"],
                 }
                 log.info("[%s] History: %d constraint frames, heading=%.3f, over-gen=%d",
                          req_id, spec.history_smplx.num_frames,

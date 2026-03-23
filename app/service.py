@@ -204,6 +204,16 @@ class KimodoService:
                     else:
                         output[key] = val[num_over:]
 
+            # Prepend history's last frame so Unreal bake has no jump
+            history_last_frame = history_info.get("last_frame")
+            if history_last_frame:
+                log.info("  Prepending history last frame to output")
+                for key in output:
+                    val = output[key]
+                    hf = history_last_frame.get(key)
+                    if hf is not None and hasattr(val, "shape") and val.ndim >= 2:
+                        output[key] = np.concatenate([hf, val], axis=-3 if val.ndim >= 3 else 0)
+
         # ---- Export to NPZ ----
         npz_bytes = self._export_npz(output, return_format=return_format)
 
@@ -533,11 +543,32 @@ class KimodoService:
             hist_root_pos[-1, 0], hist_root_pos[-1, 1], hist_root_pos[-1, 2],
         )
 
+        # --- Save history's last frame (Y-up) for prepending to output ---
+        # We store local_rot_mats and root_positions of the LAST frame.
+        # After generation, these will go through the same export pipeline
+        # (get_amass_parameters) so the output NPZ starts with history's
+        # exact last frame — no jump when Unreal bakes.
+        last_frame_data = {}
+        for key, arr in [
+            ("local_rot_mats", hist_local_rots_t.cpu().numpy()),
+            ("root_positions", hist_root_pos),
+            ("posed_joints", posed_joints.cpu().numpy()),
+            ("global_rot_mats", global_rots.cpu().numpy()),
+        ]:
+            # Take last frame, keep batch-compatible shape
+            last = arr[-1:]  # (1, ...) — single frame
+            last_frame_data[key] = last
+
+        # Also need foot_contacts and other keys the model outputs
+        # We'll fill those with zeros for the single prepended frame
+        # (they get populated during generate() trimming step)
+
         return {
             "constraints": [constraint],
             "heading_angle": heading_angle,
             "num_over_generate": num_history_frames,
             "root_origin_2d_yup": [float(root_origin_2d[0]), float(root_origin_2d[1])],
+            "last_frame": last_frame_data,
         }
 
     # ------------------------------------------------------------------
