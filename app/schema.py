@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field, model_validator
 class SegmentType(str, Enum):
     text = "text"
     trajectory = "trajectory"
+    inbetween = "inbetween"
 
 
 class TrajectoryPoint(BaseModel):
@@ -32,6 +33,13 @@ class TrajectoryPoint(BaseModel):
     pos: list[float] = Field(
         ..., min_length=3, max_length=3, description="[x, y, z] position"
     )
+
+
+class RefSmplxSpec(BaseModel):
+    """Reference SMPL-X NPZ for inbetween constraints."""
+
+    file_name: str = Field(..., description="Uploaded NPZ filename (must match multipart upload)")
+    smplx_src_start_frame: int = Field(0, ge=0, description="Start frame in the reference NPZ")
 
 
 class SegmentSpec(BaseModel):
@@ -62,6 +70,21 @@ class SegmentSpec(BaseModel):
         ),
     )
 
+    # --- inbetween-specific (same format as DART API) ---
+    ref_smplx: Optional[RefSmplxSpec] = Field(
+        None, description="Reference SMPL-X NPZ for keyframe constraints"
+    )
+    mask_mode: Optional[str] = Field(
+        "endpoints",
+        description="Constraint mode: 'endpoints' | 'keyframes' | 'all' | 'none'",
+    )
+    keyframes: Optional[list[int]] = Field(
+        None, description="Segment-local frame indices to constrain (for mask_mode='keyframes')"
+    )
+    keyframes_src_frames: Optional[list[int]] = Field(
+        None, description="Corresponding source frame indices in ref_smplx NPZ"
+    )
+
     @model_validator(mode="after")
     def validate_timing_and_type(self) -> "SegmentSpec":
         # resolve timing
@@ -79,17 +102,29 @@ class SegmentSpec(BaseModel):
             raise ValueError(
                 f"end_frame ({self.end_frame}) must be > start_frame ({self.start_frame})"
             )
+        n_frames = self.end_frame - self.start_frame
         # trajectory must have points
         if self.type == SegmentType.trajectory:
             if not self.points:
                 raise ValueError("Trajectory segment requires at least one point")
-            n_frames = self.end_frame - self.start_frame
             for pt in self.points:
                 if pt.frame >= n_frames:
                     raise ValueError(
                         f"Point frame {pt.frame} out of range for segment "
                         f"with {n_frames} frames [0, {n_frames})"
                     )
+        # inbetween must have ref_smplx
+        if self.type == SegmentType.inbetween:
+            if not self.ref_smplx:
+                raise ValueError("Inbetween segment requires ref_smplx")
+            if self.mask_mode == "keyframes" and not self.keyframes:
+                raise ValueError("mask_mode='keyframes' requires keyframes list")
+            if self.keyframes:
+                for kf in self.keyframes:
+                    if kf < 0 or kf >= n_frames:
+                        raise ValueError(
+                            f"Keyframe {kf} out of range [0, {n_frames})"
+                        )
         return self
 
 

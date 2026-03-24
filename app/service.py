@@ -585,50 +585,171 @@ class KimodoService:
     # ------------------------------------------------------------------
     # Constraint building
     # ------------------------------------------------------------------
-    def build_constraints(self, segments: list, coord_in: str = "lzyx") -> list:
+    def build_constraints(
+        self, segments: list, coord_in: str = "lzyx", staged_files: dict | None = None
+    ) -> list:
         """Build kimodo constraint objects from parsed segment specs.
 
-        Only trajectory segments produce constraints; text segments are skipped.
+        Handles trajectory (Root2DConstraintSet) and inbetween (FullBodyConstraintSet).
         """
         _ensure_kimodo_imports()
-        from kimodo.constraints import Root2DConstraintSet
+        from kimodo.constraints import FullBodyConstraintSet, Root2DConstraintSet
+        from kimodo.geometry import axis_angle_to_matrix
+        from kimodo.skeleton import fk
 
         from .coord import lzyx_root2d
 
+        staged_files = staged_files or {}
         constraints = []
+
         for seg in segments:
-            if seg.type.value != "trajectory":
-                continue
+            if seg.type.value == "trajectory":
+                constraints.extend(self._build_trajectory_constraint(seg, lzyx_root2d))
 
-            # Compute absolute frame offset for this segment
-            abs_offset = seg.start_frame
-
-            frame_indices = []
-            root2d_positions = []
-
-            for pt in seg.points:
-                abs_frame = abs_offset + pt.frame
-                frame_indices.append(abs_frame)
-
-                x_lzyx, y_lzyx = pt.pos[0], pt.pos[1]
-                # z_lzyx (height) is ignored for Root2D constraints
-                rx, rz = lzyx_root2d(x_lzyx, y_lzyx)
-                root2d_positions.append([rx, rz])
-
-            if not frame_indices:
-                continue
-
-            device = self.skeleton.device if hasattr(self.skeleton, "device") else "cpu"
-            constraint = Root2DConstraintSet(
-                self.skeleton,
-                frame_indices=torch.tensor(frame_indices, dtype=torch.long),
-                smooth_root_2d=torch.tensor(root2d_positions, dtype=torch.float32, device=device),
-            )
-            constraints.append(constraint)
-            log.info(
-                "  Built Root2D constraint: %d waypoints, frames %s",
-                len(frame_indices),
-                frame_indices,
-            )
+            elif seg.type.value == "inbetween":
+                constraints.extend(
+                    self._build_inbetween_constraint(seg, staged_files)
+                )
 
         return constraints
+
+    def _build_trajectory_constraint(self, seg, lzyx_root2d) -> list:
+        from kimodo.constraints import Root2DConstraintSet
+
+        abs_offset = seg.start_frame
+        frame_indices = []
+        root2d_positions = []
+
+        for pt in seg.points:
+            abs_frame = abs_offset + pt.frame
+            frame_indices.append(abs_frame)
+            rx, rz = lzyx_root2d(pt.pos[0], pt.pos[1])
+            root2d_positions.append([rx, rz])
+
+        if not frame_indices:
+            return []
+
+        device = self.skeleton.device if hasattr(self.skeleton, "device") else "cpu"
+        constraint = Root2DConstraintSet(
+            self.skeleton,
+            frame_indices=torch.tensor(frame_indices, dtype=torch.long),
+            smooth_root_2d=torch.tensor(root2d_positions, dtype=torch.float32, device=device),
+        )
+        log.info("  Built Root2D constraint: %d waypoints, frames %s", len(frame_indices), frame_indices)
+        return [constraint]
+
+    def _build_inbetween_constraint(self, seg, staged_files: dict) -> list:
+        """Build FullBodyConstraintSet from an inbetween segment.
+
+        Accepts the same request format as DART API:
+          ref_smplx: {file_name, smplx_src_start_frame}
+          mask_mode: "endpoints" | "keyframes" | "all" | "none"
+          keyframes: [int, ...]              (segment-local destination frames)
+          keyframes_src_frames: [int, ...]   (source frames in ref NPZ)
+        """
+        from kimodo.constraints import FullBodyConstraintSet
+        from kimodo.geometry import axis_angle_to_matrix
+        from kimodo.skeleton import fk
+
+        from .coord import M_INV
+
+        ref_spec = seg.ref_smplx
+        if ref_spec.file_name not in staged_files:
+            raise ValueError(f"ref_smplx references '{ref_spec.file_name}' but it was not uploaded")
+
+        # Load reference NPZ (DART format: poses, trans)
+        ref_data = np.load(staged_files[ref_spec.file_name], allow_pickle=True)
+        ref_poses = ref_data["poses"]    # (T, 165)
+        ref_trans = ref_data["trans"]    # (T, 3)
+        ref_T = ref_poses.shape[0]
+        src_start = ref_spec.smplx_src_start_frame
+
+        log.info("  Inbetween ref NPZ: %d frames, src_start=%d", ref_T, src_start)
+
+        # Determine which frames to constrain
+        n_frames = seg.end_frame - seg.start_frame
+        mask_mode = seg.mask_mode or "endpoints"
+
+        if mask_mode == "none":
+            log.info("  mask_mode=none → no constraints")
+            return []
+        elif mask_mode == "endpoints":
+            dest_frames = [0, n_frames - 1]
+            src_frames = [src_start, src_start + n_frames - 1]
+        elif mask_mode == "all":
+            dest_frames = list(range(n_frames))
+            src_frames = [src_start + i for i in range(n_frames)]
+        elif mask_mode == "keyframes":
+            dest_frames = list(seg.keyframes)
+            if seg.keyframes_src_frames:
+                src_frames = list(seg.keyframes_src_frames)
+            else:
+                src_frames = [src_start + kf for kf in dest_frames]
+        else:
+            raise ValueError(f"Unknown mask_mode: {mask_mode}")
+
+        # Validate source frames
+        for sf in src_frames:
+            if sf < 0 or sf >= ref_T:
+                raise ValueError(f"Source frame {sf} out of range [0, {ref_T})")
+
+        log.info("  mask_mode=%s: %d keyframes, dest=%s, src=%s",
+                  mask_mode, len(dest_frames), dest_frames, src_frames)
+
+        # Extract poses at keyframe source frames
+        n_body_joints = (ref_poses.shape[-1] - 3 - 99) // 3  # typically 21
+        kf_poses = ref_poses[src_frames]     # (K, 165)
+        kf_trans = ref_trans[src_frames]     # (K, 3)
+
+        # Parse into root_orient + body_pose (axis-angle)
+        kf_root_aa = kf_poses[:, :3]                    # (K, 3)
+        kf_body_aa = kf_poses[:, 3:3 + n_body_joints * 3]  # (K, n_body*3)
+        kf_body_aa = kf_body_aa.reshape(-1, n_body_joints, 3)  # (K, n_body, 3)
+
+        # Combine into full local rotation: (K, J, 3)
+        kf_all_aa = np.concatenate(
+            [kf_root_aa[:, np.newaxis, :], kf_body_aa], axis=1
+        )  # (K, J, 3)
+
+        # Convert Z-up (lzyx) to Y-up for Kimodo FK
+        pelvis_offset = self.skeleton.neutral_joints[self.skeleton.root_idx].cpu().numpy()
+        trans_yup = np.matmul(kf_trans + pelvis_offset, M_INV.T) - pelvis_offset
+        root_positions = (trans_yup + pelvis_offset).astype(np.float32)
+
+        # Undo Z-up rotation on root orient
+        root_rots_mat = axis_angle_to_matrix(
+            torch.tensor(kf_all_aa[:, 0], dtype=torch.float32)
+        ).numpy()
+        root_rots_yup = np.matmul(M_INV.T, root_rots_mat)
+
+        # Body local rotations (no coord conversion needed)
+        body_rots = axis_angle_to_matrix(
+            torch.tensor(kf_all_aa[:, 1:], dtype=torch.float32)
+        ).numpy()
+
+        local_rot_mats = np.concatenate(
+            [root_rots_yup[:, np.newaxis, :, :], body_rots], axis=1
+        ).astype(np.float32)  # (K, J, 3, 3)
+
+        # FK to get global positions and rotations
+        device = self.skeleton.device if hasattr(self.skeleton, "device") else "cpu"
+        local_rots_t = torch.tensor(local_rot_mats, dtype=torch.float32, device=device)
+        root_pos_t = torch.tensor(root_positions, dtype=torch.float32, device=device)
+        global_rots, posed_joints, _ = fk(local_rots_t, root_pos_t, self.skeleton)
+
+        # Build constraint with absolute frame indices
+        abs_offset = seg.start_frame
+        abs_frames = [abs_offset + df for df in dest_frames]
+
+        smooth_root_2d = posed_joints[:, self.skeleton.root_idx, [0, 2]]
+
+        constraint = FullBodyConstraintSet(
+            self.skeleton,
+            frame_indices=torch.tensor(abs_frames, dtype=torch.long, device=device),
+            global_joints_positions=posed_joints,
+            global_joints_rots=global_rots,
+            smooth_root_2d=smooth_root_2d,
+        )
+
+        log.info("  Built FullBody constraint: %d keyframes at abs frames %s", len(abs_frames), abs_frames)
+        return [constraint]

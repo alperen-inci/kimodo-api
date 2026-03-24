@@ -187,7 +187,7 @@ async def generate_timeline(
         # ---- Build segment constraints ----
         try:
             segment_constraints = service.build_constraints(
-                spec.segments, coord_in=spec.coord_in
+                spec.segments, coord_in=spec.coord_in, staged_files=staged_files
             )
         except Exception as e:
             log.error("[%s] Failed to build constraints: %s", req_id, e)
