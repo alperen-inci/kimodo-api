@@ -267,39 +267,17 @@ class KimodoService:
             local_rot_mats = local_rot_mats[np.newaxis]
             root_positions = root_positions[np.newaxis]
 
-        # Use z_up=False to get raw Y-up output, then apply our own
-        # DART-compatible coordinate conversion (no rot_z_180 X negation).
         trans, root_orient, pose_body = get_amass_parameters(
-            local_rot_mats, root_positions, self.skeleton, z_up=False
+            local_rot_mats, root_positions, self.skeleton, z_up=True
         )
 
-        # Apply DART-compatible Y-up → Z-up conversion (pure Y<->Z swap)
-        from .coord import M
-        from kimodo.geometry import axis_angle_to_matrix, matrix_to_axis_angle
-        import torch
-
-        pelvis_offset = self.skeleton.neutral_joints[self.skeleton.root_idx].cpu().numpy()
-
-        # Convert translations: v_lzyx = (v + pelvis_offset) @ M.T - pelvis_offset
+        # Negate Y (forward) to match DART/UnrealSMPLXImporter convention.
+        # Kimodo's get_amass_parameters applies rot_z_180 which negates X and Y.
+        # DART expects Y=+forward, but Kimodo produces Y=-forward.
         if trans.ndim == 3:
-            for b in range(trans.shape[0]):
-                trans[b] = np.matmul(trans[b] + pelvis_offset, M.T) - pelvis_offset
+            trans[:, :, 1] *= -1.0
         else:
-            trans = np.matmul(trans + pelvis_offset, M.T) - pelvis_offset
-
-        # Convert root orient: R_lzyx = M @ R_yup @ M.T
-        def convert_root_orient(ro):
-            ro_t = torch.tensor(ro, dtype=torch.float32)
-            ro_mat = axis_angle_to_matrix(ro_t)
-            M_t = torch.tensor(M, dtype=torch.float32)
-            ro_mat_lzyx = torch.einsum('ij,...jk,kl->...il', M_t, ro_mat, M_t.T)
-            return matrix_to_axis_angle(ro_mat_lzyx).numpy()
-
-        if root_orient.ndim == 3:
-            for b in range(root_orient.shape[0]):
-                root_orient[b] = convert_root_orient(root_orient[b])
-        else:
-            root_orient = convert_root_orient(root_orient)
+            trans[:, 1] *= -1.0
 
         # Squeeze batch dim for single sample
         if trans.shape[0] == 1:
