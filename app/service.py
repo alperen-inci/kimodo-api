@@ -586,11 +586,15 @@ class KimodoService:
     # Constraint building
     # ------------------------------------------------------------------
     def build_constraints(
-        self, segments: list, coord_in: str = "lzyx", staged_files: dict | None = None
+        self, segments: list, coord_in: str = "lzyx", staged_files: dict | None = None,
+        origin_offset_2d: "torch.Tensor | None" = None,
     ) -> list:
         """Build kimodo constraint objects from parsed segment specs.
 
         Handles trajectory (Root2DConstraintSet) and inbetween (FullBodyConstraintSet).
+        When history is used, the model generates at origin. All constraints must be
+        translated by origin_offset_2d (the history's root position in Y-up XZ plane)
+        so they're in the same origin-centered frame.
         """
         _ensure_kimodo_imports()
         from kimodo.constraints import FullBodyConstraintSet, Root2DConstraintSet
@@ -604,16 +608,16 @@ class KimodoService:
 
         for seg in segments:
             if seg.type.value == "trajectory":
-                constraints.extend(self._build_trajectory_constraint(seg, lzyx_root2d))
+                constraints.extend(self._build_trajectory_constraint(seg, lzyx_root2d, origin_offset_2d))
 
             elif seg.type.value == "inbetween":
                 constraints.extend(
-                    self._build_inbetween_constraint(seg, staged_files)
+                    self._build_inbetween_constraint(seg, staged_files, origin_offset_2d)
                 )
 
         return constraints
 
-    def _build_trajectory_constraint(self, seg, lzyx_root2d) -> list:
+    def _build_trajectory_constraint(self, seg, lzyx_root2d, origin_offset_2d=None) -> list:
         from kimodo.constraints import Root2DConstraintSet
 
         abs_offset = seg.start_frame
@@ -630,15 +634,25 @@ class KimodoService:
             return []
 
         device = self.skeleton.device if hasattr(self.skeleton, "device") else "cpu"
+        root2d_t = torch.tensor(root2d_positions, dtype=torch.float32, device=device)
+
+        # Translate to origin (same as history constraints) so model sees
+        # trajectory waypoints relative to origin, not absolute position.
+        if origin_offset_2d is not None:
+            offset = origin_offset_2d.to(device=device, dtype=torch.float32)
+            root2d_t = root2d_t - offset.unsqueeze(0)
+            log.info("  Trajectory translated to origin by offset=[%.3f, %.3f]",
+                      offset[0].item(), offset[1].item())
+
         constraint = Root2DConstraintSet(
             self.skeleton,
             frame_indices=torch.tensor(frame_indices, dtype=torch.long, device=device),
-            smooth_root_2d=torch.tensor(root2d_positions, dtype=torch.float32, device=device),
+            smooth_root_2d=root2d_t,
         )
         log.info("  Built Root2D constraint: %d waypoints, frames %s", len(frame_indices), frame_indices)
         return [constraint]
 
-    def _build_inbetween_constraint(self, seg, staged_files: dict) -> list:
+    def _build_inbetween_constraint(self, seg, staged_files: dict, origin_offset_2d=None) -> list:
         """Build FullBodyConstraintSet from an inbetween segment.
 
         Accepts the same request format as DART API:
@@ -745,6 +759,15 @@ class KimodoService:
         abs_frames = [abs_offset + df for df in dest_frames]
 
         smooth_root_2d = posed_joints[:, self.skeleton.root_idx, [0, 2]]
+
+        # Translate to origin (same as history constraints)
+        if origin_offset_2d is not None:
+            offset = origin_offset_2d.to(device=device, dtype=torch.float32)
+            posed_joints[:, :, 0] -= offset[0]  # X in Y-up
+            posed_joints[:, :, 2] -= offset[1]  # Z in Y-up
+            smooth_root_2d = smooth_root_2d - offset.unsqueeze(0)
+            log.info("  Inbetween translated to origin by offset=[%.3f, %.3f]",
+                      offset[0].item(), offset[1].item())
 
         constraint = FullBodyConstraintSet(
             self.skeleton,

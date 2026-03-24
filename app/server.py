@@ -185,9 +185,17 @@ async def generate_timeline(
             num_frames.append(seg.end_frame - seg.start_frame)
 
         # ---- Build segment constraints ----
+        # Pass origin offset so trajectory/inbetween constraints are translated
+        # to the same origin-centered frame as history constraints.
+        origin_offset_2d = None
+        if history_info:
+            import torch
+            origin_offset_2d = torch.tensor(
+                history_info["root_origin_2d_yup"], dtype=torch.float32)
         try:
             segment_constraints = service.build_constraints(
-                spec.segments, coord_in=spec.coord_in, staged_files=staged_files
+                spec.segments, coord_in=spec.coord_in, staged_files=staged_files,
+                origin_offset_2d=origin_offset_2d,
             )
         except Exception as e:
             log.error("[%s] Failed to build constraints: %s", req_id, e)
