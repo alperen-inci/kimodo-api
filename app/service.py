@@ -271,13 +271,30 @@ class KimodoService:
             local_rot_mats, root_positions, self.skeleton, z_up=True
         )
 
-        # Negate Y (forward) to match DART/UnrealSMPLXImporter convention.
-        # Kimodo's get_amass_parameters applies rot_z_180 which negates X and Y.
-        # DART expects Y=+forward, but Kimodo produces Y=-forward.
-        if trans.ndim == 3:
-            trans[:, :, 1] *= -1.0
+        # Kimodo's get_amass_parameters applies rot_z_180 which makes the character
+        # face -Y instead of +Y in lzyx. Apply 180° around Z (up axis in lzyx) to
+        # the root orient so the character faces +Y (forward), matching DART convention.
+        # This is equivalent to: R_fixed = Rz(pi) @ R_original
+        import torch as _torch
+        from kimodo.geometry import axis_angle_to_matrix, matrix_to_axis_angle
+
+        _rot_z_180 = _torch.tensor([
+            [-1.0, 0.0, 0.0],
+            [0.0, -1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ], dtype=_torch.float32)
+
+        def _flip_root(ro_aa):
+            ro_t = _torch.tensor(ro_aa, dtype=_torch.float32)
+            ro_mat = axis_angle_to_matrix(ro_t)
+            ro_mat_fixed = _torch.einsum('ij,...jk->...ik', _rot_z_180, ro_mat)
+            return matrix_to_axis_angle(ro_mat_fixed).numpy()
+
+        if root_orient.ndim == 3:
+            for b in range(root_orient.shape[0]):
+                root_orient[b] = _flip_root(root_orient[b])
         else:
-            trans[:, 1] *= -1.0
+            root_orient = _flip_root(root_orient)
 
         # Squeeze batch dim for single sample
         if trans.shape[0] == 1:
