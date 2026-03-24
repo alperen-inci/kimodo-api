@@ -271,30 +271,39 @@ class KimodoService:
             local_rot_mats, root_positions, self.skeleton, z_up=True
         )
 
-        # Kimodo's get_amass_parameters applies rot_z_180 which makes the character
-        # face -Y instead of +Y in lzyx. Apply 180° around Z (up axis in lzyx) to
-        # the root orient so the character faces +Y (forward), matching DART convention.
-        # This is equivalent to: R_fixed = Rz(pi) @ R_original
+        # Kimodo's get_amass_parameters includes rot_z_180 which puts the character
+        # facing -Y (backward in DART/UE convention). DART expects +Y = forward.
+        # Undo rot_z_180 on BOTH translation and root orient to match DART convention.
+        # rot_z_180 negates X and Y in translation, and rotates root 180° around Z.
         import torch as _torch
         from kimodo.geometry import axis_angle_to_matrix, matrix_to_axis_angle
 
+        # Undo translation: negate X and Y (rot_z_180 negated them)
+        if trans.ndim == 3:
+            trans[:, :, 0] *= -1.0
+            trans[:, :, 1] *= -1.0
+        else:
+            trans[:, 0] *= -1.0
+            trans[:, 1] *= -1.0
+
+        # Undo root orient: apply inverse rot_z_180 (= rot_z_180 itself, it's an involution)
         _rot_z_180 = _torch.tensor([
             [-1.0, 0.0, 0.0],
             [0.0, -1.0, 0.0],
             [0.0, 0.0, 1.0],
         ], dtype=_torch.float32)
 
-        def _flip_root(ro_aa):
+        def _undo_rot_z_180(ro_aa):
             ro_t = _torch.tensor(ro_aa, dtype=_torch.float32)
             ro_mat = axis_angle_to_matrix(ro_t)
-            ro_mat_fixed = _torch.einsum('ij,...jk->...ik', _rot_z_180, ro_mat)
-            return matrix_to_axis_angle(ro_mat_fixed).numpy()
+            ro_fixed = _torch.einsum('ij,...jk->...ik', _rot_z_180, ro_mat)
+            return matrix_to_axis_angle(ro_fixed).numpy()
 
         if root_orient.ndim == 3:
             for b in range(root_orient.shape[0]):
-                root_orient[b] = _flip_root(root_orient[b])
+                root_orient[b] = _undo_rot_z_180(root_orient[b])
         else:
-            root_orient = _flip_root(root_orient)
+            root_orient = _undo_rot_z_180(root_orient)
 
         # Squeeze batch dim for single sample
         if trans.shape[0] == 1:
