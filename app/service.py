@@ -267,9 +267,39 @@ class KimodoService:
             local_rot_mats = local_rot_mats[np.newaxis]
             root_positions = root_positions[np.newaxis]
 
+        # Use z_up=False to get raw Y-up output, then apply our own
+        # DART-compatible coordinate conversion (no rot_z_180 X negation).
         trans, root_orient, pose_body = get_amass_parameters(
-            local_rot_mats, root_positions, self.skeleton, z_up=True
+            local_rot_mats, root_positions, self.skeleton, z_up=False
         )
+
+        # Apply DART-compatible Y-up → Z-up conversion (pure Y<->Z swap)
+        from .coord import M
+        from kimodo.geometry import axis_angle_to_matrix, matrix_to_axis_angle
+        import torch
+
+        pelvis_offset = self.skeleton.neutral_joints[self.skeleton.root_idx].cpu().numpy()
+
+        # Convert translations: v_lzyx = (v + pelvis_offset) @ M.T - pelvis_offset
+        if trans.ndim == 3:
+            for b in range(trans.shape[0]):
+                trans[b] = np.matmul(trans[b] + pelvis_offset, M.T) - pelvis_offset
+        else:
+            trans = np.matmul(trans + pelvis_offset, M.T) - pelvis_offset
+
+        # Convert root orient: R_lzyx = M @ R_yup @ M.T
+        def convert_root_orient(ro):
+            ro_t = torch.tensor(ro, dtype=torch.float32)
+            ro_mat = axis_angle_to_matrix(ro_t)
+            M_t = torch.tensor(M, dtype=torch.float32)
+            ro_mat_lzyx = torch.einsum('ij,...jk,kl->...il', M_t, ro_mat, M_t.T)
+            return matrix_to_axis_angle(ro_mat_lzyx).numpy()
+
+        if root_orient.ndim == 3:
+            for b in range(root_orient.shape[0]):
+                root_orient[b] = convert_root_orient(root_orient[b])
+        else:
+            root_orient = convert_root_orient(root_orient)
 
         # Squeeze batch dim for single sample
         if trans.shape[0] == 1:
@@ -632,7 +662,7 @@ class KimodoService:
         device = self.skeleton.device if hasattr(self.skeleton, "device") else "cpu"
         constraint = Root2DConstraintSet(
             self.skeleton,
-            frame_indices=torch.tensor(frame_indices, dtype=torch.long),
+            frame_indices=torch.tensor(frame_indices, dtype=torch.long, device=device),
             smooth_root_2d=torch.tensor(root2d_positions, dtype=torch.float32, device=device),
         )
         log.info("  Built Root2D constraint: %d waypoints, frames %s", len(frame_indices), frame_indices)
