@@ -675,10 +675,13 @@ class KimodoService:
             return []
         elif mask_mode == "endpoints":
             dest_frames = [0, n_frames - 1]
-            src_frames = [src_start, src_start + n_frames - 1]
+            # Use first and last frame of the ref NPZ (not offset by n_frames)
+            src_frames = [src_start, min(src_start + ref_T - 1, ref_T - 1)]
         elif mask_mode == "all":
-            dest_frames = list(range(n_frames))
-            src_frames = [src_start + i for i in range(n_frames)]
+            # Constrain every frame — need enough ref frames
+            actual_len = min(n_frames, ref_T - src_start)
+            dest_frames = list(range(actual_len))
+            src_frames = [src_start + i for i in range(actual_len)]
         elif mask_mode == "keyframes":
             dest_frames = list(seg.keyframes)
             if seg.keyframes_src_frames:
