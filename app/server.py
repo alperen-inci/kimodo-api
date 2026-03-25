@@ -218,6 +218,7 @@ async def generate_timeline(
                 num_transition_frames=spec.num_transition_frames,
                 return_format=spec.return_format,
                 history_info=history_info,
+                first_heading_angle_override=spec.first_heading_angle,
             )
             elapsed = time.time() - t0
             log.info(

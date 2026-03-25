@@ -195,6 +195,11 @@ class TimelineSpec(BaseModel):
         True, description="Apply foot-skating cleanup and constraint enforcement"
     )
 
+    # --- heading ---
+    first_heading_angle: Optional[float] = Field(
+        None, description="Initial body heading in radians. None = auto (0.0 if no history). Used for first generation without history."
+    )
+
     # --- transition ---
     num_transition_frames: int = Field(
         5, ge=0, le=30, description="Transition blend frames between segments"

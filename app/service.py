@@ -95,6 +95,7 @@ class KimodoService:
         num_transition_frames: int = 5,
         return_format: str = "npz",
         history_info: dict | None = None,
+        first_heading_angle_override: float | None = None,
     ) -> dict:
         """Run inference and return output dict.
 
@@ -118,10 +119,10 @@ class KimodoService:
 
         # --- Over-generate for history continuation ---
         num_over = 0
-        first_heading_angle = None
+        first_heading_angle = first_heading_angle_override  # from spec, None if not set
         if history_info:
             num_over = history_info["num_over_generate"]
-            first_heading_angle = history_info.get("heading_angle")
+            first_heading_angle = history_info.get("heading_angle")  # history overrides spec
             # Add overlap frames to the first segment
             num_frames = num_frames.copy()
             num_frames[0] += num_over
