@@ -126,6 +126,12 @@ class KimodoService:
             # Add overlap frames to the first segment
             num_frames = num_frames.copy()
             num_frames[0] += num_over
+            # Shift constraint frame indices to account for over-gen prefix.
+            # Without this, constraints are applied num_over frames too early
+            # because the first num_over frames are history overlap, not content.
+            for seg in segments:
+                seg.start_frame += num_over
+                seg.end_frame += num_over
             log.info("  History: over-generating %d extra frames on segment 0, heading=%.3f",
                       num_over, first_heading_angle if first_heading_angle is not None else 0.0)
 
