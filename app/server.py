@@ -192,6 +192,12 @@ async def generate_timeline(
             import torch
             origin_offset_2d = torch.tensor(
                 history_info["root_origin_2d_yup"], dtype=torch.float32)
+            # Shift segment frame indices by over-gen amount so constraints
+            # align with content frames (not history overlap prefix).
+            num_over = history_info["num_over_generate"]
+            for seg in spec.segments:
+                seg.start_frame += num_over
+                seg.end_frame += num_over
         try:
             segment_constraints = service.build_constraints(
                 spec.segments, coord_in=spec.coord_in, staged_files=staged_files,
