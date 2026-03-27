@@ -227,7 +227,12 @@ class KimodoService:
                         log.info("    result shape=%s", output[key].shape)
 
         # ---- Export to NPZ ----
-        npz_bytes = self._export_npz(output, return_format=return_format)
+        # Use history betas if available so the output character matches the input.
+        override_betas = None
+        if history_info and history_info.get("betas") is not None:
+            override_betas = history_info["betas"]
+        npz_bytes = self._export_npz(output, return_format=return_format,
+                                     override_betas=override_betas)
 
         actual_frames = int(output["posed_joints"].shape[-3])
         meta = {
@@ -250,7 +255,8 @@ class KimodoService:
     # ------------------------------------------------------------------
     # NPZ export
     # ------------------------------------------------------------------
-    def _export_npz(self, output: dict, return_format: str = "npz") -> bytes:
+    def _export_npz(self, output: dict, return_format: str = "npz",
+                    override_betas: np.ndarray | None = None) -> bytes:
         """Convert model output to NPZ bytes.
 
         Two formats:
@@ -281,9 +287,11 @@ class KimodoService:
         T = trans.shape[-2] if trans.ndim >= 2 else trans.shape[0]
 
         if return_format == "amass_npz":
-            return self._pack_amass_npz(trans, root_orient, pose_body, T)
+            return self._pack_amass_npz(trans, root_orient, pose_body, T,
+                                       override_betas=override_betas)
         else:
-            return self._pack_dart_npz(trans, root_orient, pose_body, T)
+            return self._pack_dart_npz(trans, root_orient, pose_body, T,
+                                       override_betas=override_betas)
 
     def _pack_dart_npz(
         self,
@@ -291,6 +299,7 @@ class KimodoService:
         root_orient: np.ndarray,
         pose_body: np.ndarray,
         T: int,
+        override_betas: np.ndarray | None = None,
     ) -> bytes:
         """Pack into DART-compatible NPZ.
 
@@ -325,11 +334,18 @@ class KimodoService:
             f"Expected {total_dims} pose dims, got {poses.shape[-1]}"
         )
 
-        betas = np.zeros(16, dtype=np.float32)
-        if self.amass_converter:
+        # Toggle: True = zero betas (neutral template), False = model default betas
+        use_zero_betas = True
+
+        if override_betas is not None:
+            betas = override_betas
+            log.info("  Using history betas for export: %s", betas[:6])
+        elif use_zero_betas:
+            betas = np.zeros(16, dtype=np.float32)
+        else:
             betas = self.amass_converter.output_dict_base.get(
                 "betas", np.zeros(16, dtype=np.float32)
-            )
+            ) if self.amass_converter else np.zeros(16, dtype=np.float32)
 
         # Store skeleton info so consumer knows the layout
         n_body_joints = n_body_dims // 3
@@ -354,9 +370,13 @@ class KimodoService:
         root_orient: np.ndarray,
         pose_body: np.ndarray,
         T: int,
+        override_betas: np.ndarray | None = None,
     ) -> bytes:
         """Pack into AMASS-style NPZ."""
         base = dict(self.amass_converter.output_dict_base)
+        if override_betas is not None:
+            base["betas"] = override_betas
+            log.info("  Using history betas for AMASS export: %s", override_betas[:6])
         for key, val in self.amass_converter.default_frame_params.items():
             import einops
 
@@ -575,12 +595,19 @@ class KimodoService:
         # We'll fill those with zeros for the single prepended frame
         # (they get populated during generate() trimming step)
 
+        # --- Preserve history betas so export uses the same body shape ---
+        history_betas = None
+        if "betas" in keys:
+            history_betas = np.array(data["betas"], dtype=np.float32).flatten()
+            log.info("  History betas: %s (shape=%s)", history_betas[:6], history_betas.shape)
+
         return {
             "constraints": [constraint],
             "heading_angle": heading_angle,
             "num_over_generate": num_history_frames,
             "root_origin_2d_yup": [float(root_origin_2d[0]), float(root_origin_2d[1])],
             "last_frame": last_frame_data,
+            "betas": history_betas,
         }
 
     # ------------------------------------------------------------------
