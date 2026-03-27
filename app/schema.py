@@ -153,9 +153,7 @@ class TimelineSpec(BaseModel):
     # --- model ---
     model: str = Field(
         "smplx",
-        description=(
-            "Kimodo model variant. 'smplx' (default) uses Kimodo-SMPLX-RP-v1."
-        ),
+        description="Model variant.",
     )
 
     # --- history / continuation ---
@@ -239,8 +237,5 @@ class TimelineSpec(BaseModel):
 
 class HealthResponse(BaseModel):
     status: str
-    device: str
     model_loaded: bool
-    model_name: Optional[str] = None
-    skeleton: Optional[str] = None
     detail: Optional[str] = None

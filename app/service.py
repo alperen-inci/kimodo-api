@@ -342,8 +342,6 @@ class KimodoService:
             "diffusion_steps": diffusion_steps,
             "num_samples": num_samples,
             "elapsed_sec": round(elapsed, 2),
-            "model": self.model_name,
-            "skeleton": self.skeleton.name,
             "fps": int(self.model.fps),
             "total_frames": actual_frames,
             "return_format": return_format,
@@ -447,9 +445,8 @@ class KimodoService:
                 "betas", np.zeros(16, dtype=np.float32)
             ) if self.amass_converter else np.zeros(16, dtype=np.float32)
 
-        # Store skeleton info so consumer knows the layout
+        # Store joint count so consumer knows the layout
         n_body_joints = n_body_dims // 3
-        skeleton_name = self.skeleton.name if self.skeleton else "unknown"
 
         buf = io.BytesIO()
         np.savez(
@@ -460,7 +457,6 @@ class KimodoService:
             gender="neutral",
             mocap_framerate=np.int64(30),
             n_body_joints=np.int64(n_body_joints),
-            skeleton=skeleton_name,
         )
         return buf.getvalue()
 

@@ -69,20 +69,9 @@ async def startup():
 async def health():
     """Check service health and model readiness."""
     if service.is_loaded:
-        return HealthResponse(
-            status="ok",
-            device=DEVICE,
-            model_loaded=True,
-            model_name=MODEL_NAME,
-            skeleton=service.skeleton.name if service.skeleton else None,
-        )
+        return HealthResponse(status="ok", model_loaded=True)
     else:
-        return HealthResponse(
-            status="not_ready",
-            device=DEVICE,
-            model_loaded=False,
-            detail="Model not loaded. Check startup logs.",
-        )
+        return HealthResponse(status="not_ready", model_loaded=False, detail="Model not loaded")
 
 
 # ---------------------------------------------------------------------------
@@ -114,7 +103,7 @@ async def generate_timeline(
         raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}")
     except Exception as e:
         log.error("[%s] Spec validation failed: %s", req_id, e)
-        raise HTTPException(status_code=400, detail=f"Spec validation error: {e}")
+        raise HTTPException(status_code=400, detail="Invalid request specification")
 
     log.info(
         "[%s] Parsed spec: %d segment(s), seed=%d, steps=%d, samples=%d, format=%s, history=%s",
@@ -175,7 +164,7 @@ async def generate_timeline(
                          history_result["num_over_generate"])
             except Exception as e:
                 log.error("[%s] Failed to build history constraints: %s", req_id, e)
-                raise HTTPException(status_code=400, detail=f"History constraint error: {e}")
+                raise HTTPException(status_code=400, detail="History constraint error")
 
         # ---- Build texts and num_frames ----
         texts = []
@@ -205,7 +194,7 @@ async def generate_timeline(
             )
         except Exception as e:
             log.error("[%s] Failed to build constraints: %s", req_id, e)
-            raise HTTPException(status_code=400, detail=f"Constraint error: {e}")
+            raise HTTPException(status_code=400, detail="Constraint error")
 
         constraint_lst = history_constraints + segment_constraints
 
@@ -235,7 +224,7 @@ async def generate_timeline(
             )
         except Exception as e:
             log.exception("[%s] Generation failed", req_id)
-            raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
+            raise HTTPException(status_code=500, detail="Generation failed")
 
     finally:
         # Cleanup temp files
@@ -244,13 +233,16 @@ async def generate_timeline(
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
     # ---- Return NPZ ----
-    filename = f"kimodo_motion_{req_id}.npz"
+    filename = f"motion_{req_id}.npz"
     return Response(
         content=result["npz_bytes"],
         media_type="application/octet-stream",
         headers={
             "Content-Disposition": f'attachment; filename="{filename}"',
-            "X-Kimodo-Meta": json.dumps(result["meta"]),
+            "X-Kimodo-Meta": json.dumps({
+                k: v for k, v in result["meta"].items()
+                if k in ("total_frames", "fps", "elapsed_sec")
+            }),
         },
     )
 
@@ -263,7 +255,7 @@ async def global_exception_handler(request: Request, exc: Exception):
     log.exception("Unhandled exception: %s", exc)
     return JSONResponse(
         status_code=500,
-        content={"detail": f"Internal server error: {type(exc).__name__}: {exc}"},
+        content={"detail": "Internal server error"},
     )
 
 
