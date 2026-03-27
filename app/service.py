@@ -17,6 +17,59 @@ import torch
 
 log = logging.getLogger("kimodo_api.service")
 
+# ---------------------------------------------------------------------------
+# Auto-chunking: split segments longer than MAX_CHUNK_FRAMES so each piece
+# stays within the model's effective quality window.  The model's internal
+# _multiprompt handles 5-frame history + 10% over-generate between chunks.
+# ---------------------------------------------------------------------------
+MAX_CHUNK_FRAMES = int(os.environ.get("KIMODO_MAX_CHUNK_FRAMES", "300"))   # 10s @ 30fps
+CHUNK_SIZE = int(os.environ.get("KIMODO_CHUNK_SIZE", "240"))               # 8s @ 30fps
+MIN_CHUNK_FRAMES = 60  # avoid tiny tail chunks (< 2s)
+
+
+def _split_long_segments(
+    texts: list[str], num_frames: list[int],
+) -> tuple[list[str], list[int], bool]:
+    """Split any segment exceeding *MAX_CHUNK_FRAMES* into ≤ *CHUNK_SIZE* pieces.
+
+    Returns (texts_out, num_frames_out, did_chunk).
+    """
+    out_texts: list[str] = []
+    out_frames: list[int] = []
+    did_chunk = False
+
+    for text, nf in zip(texts, num_frames):
+        if nf <= MAX_CHUNK_FRAMES:
+            out_texts.append(text)
+            out_frames.append(nf)
+            continue
+
+        # Build chunks of CHUNK_SIZE; last piece gets the remainder.
+        did_chunk = True
+        chunks: list[int] = []
+        remaining = nf
+        while remaining > MAX_CHUNK_FRAMES:
+            chunks.append(CHUNK_SIZE)
+            remaining -= CHUNK_SIZE
+        # Remaining tail
+        if remaining > 0:
+            if remaining < MIN_CHUNK_FRAMES and chunks:
+                chunks[-1] += remaining  # merge tiny tail into prev chunk
+            else:
+                chunks.append(remaining)
+
+        for c in chunks:
+            out_texts.append(text)
+            out_frames.append(c)
+
+        log.info(
+            "  Auto-chunked '%s' (%d frames / %.1fs) → %d chunks %s",
+            text[:50], nf, nf / 30.0, len(chunks), chunks,
+        )
+
+    return out_texts, out_frames, did_chunk
+
+
 # Lazy imports — heavy deps loaded at model-load time, not at import time.
 _kimodo_loaded = False
 
@@ -129,11 +182,15 @@ class KimodoService:
             log.info("  History: over-generating %d extra frames on segment 0, heading=%.3f",
                       num_over, first_heading_angle if first_heading_angle is not None else 0.0)
 
+        # --- Auto-chunk long segments ---
+        texts, num_frames, did_chunk = _split_long_segments(texts, num_frames)
+
         total_frames = sum(num_frames)
         log.info(
-            "Generating: %d segment(s), %d total frames (%.1fs), "
+            "Generating: %d segment(s)%s, %d total frames (%.1fs), "
             "seed=%d, steps=%d, samples=%d, post_process=%s",
             len(texts),
+            " (auto-chunked)" if did_chunk else "",
             total_frames,
             total_frames / 30.0,
             seed,
