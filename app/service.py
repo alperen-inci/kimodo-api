@@ -27,6 +27,48 @@ CHUNK_SIZE = int(os.environ.get("KIMODO_CHUNK_SIZE", "240"))               # 8s 
 MIN_CHUNK_FRAMES = 60  # avoid tiny tail chunks (< 2s)
 
 
+def _expand_comma_segments(
+    texts: list[str], num_frames: list[int],
+) -> tuple[list[str], list[int], bool]:
+    """Split comma-separated motion descriptions into individual segments.
+
+    "walk forward, run, turn left" with 900 frames becomes three 300-frame
+    segments.  Duration is divided equally among the parts.
+
+    Returns (texts_out, num_frames_out, did_expand).
+    """
+    out_texts: list[str] = []
+    out_frames: list[int] = []
+    did_expand = False
+
+    for text, nf in zip(texts, num_frames):
+        parts = [p.strip() for p in text.split(",") if p.strip()]
+        if len(parts) <= 1:
+            out_texts.append(text)
+            out_frames.append(nf)
+            continue
+
+        did_expand = True
+        per_part = nf // len(parts)
+        leftover = nf - per_part * len(parts)
+
+        part_frames = []
+        for i, p in enumerate(parts):
+            # distribute leftover frames to the last part
+            f = per_part + (leftover if i == len(parts) - 1 else 0)
+            out_texts.append(p)
+            out_frames.append(f)
+            part_frames.append(f)
+
+        log.info(
+            "  Comma-split '%s' (%d frames) → %d parts %s",
+            text[:60], nf, len(parts),
+            list(zip([p[:30] for p in parts], part_frames)),
+        )
+
+    return out_texts, out_frames, did_expand
+
+
 def _split_long_segments(
     texts: list[str], num_frames: list[int],
 ) -> tuple[list[str], list[int], bool]:
@@ -182,7 +224,8 @@ class KimodoService:
             log.info("  History: over-generating %d extra frames on segment 0, heading=%.3f",
                       num_over, first_heading_angle if first_heading_angle is not None else 0.0)
 
-        # --- Auto-chunk long segments ---
+        # --- Expand comma-separated texts, then auto-chunk long segments ---
+        texts, num_frames, _ = _expand_comma_segments(texts, num_frames)
         texts, num_frames, did_chunk = _split_long_segments(texts, num_frames)
 
         total_frames = sum(num_frames)
