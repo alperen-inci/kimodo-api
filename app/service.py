@@ -23,7 +23,7 @@ log = logging.getLogger("kimodo_api.service")
 # _multiprompt handles 5-frame history + 10% over-generate between chunks.
 # ---------------------------------------------------------------------------
 MAX_CHUNK_FRAMES = int(os.environ.get("KIMODO_MAX_CHUNK_FRAMES", "300"))   # 10s @ 30fps
-CHUNK_SIZE = int(os.environ.get("KIMODO_CHUNK_SIZE", "240"))               # 8s @ 30fps
+CHUNK_SIZE = int(os.environ.get("KIMODO_CHUNK_SIZE", "300"))               # 10s @ 30fps
 MIN_CHUNK_FRAMES = 60  # avoid tiny tail chunks (< 2s)
 
 
@@ -757,6 +757,14 @@ class KimodoService:
         if not frame_indices:
             return []
 
+        # --- Intermediate target interpolation ---
+        # When a waypoint is far away (multiple chunks), the character has no
+        # guidance in earlier chunks and wanders.  Insert linearly interpolated
+        # intermediate waypoints at every CHUNK_SIZE interval so each chunk
+        # gets a trajectory hint pointing toward the final target.
+        frame_indices, root2d_positions = self._insert_intermediate_waypoints(
+            frame_indices, root2d_positions, abs_offset)
+
         device = self.skeleton.device if hasattr(self.skeleton, "device") else "cpu"
         root2d_t = torch.tensor(root2d_positions, dtype=torch.float32, device=device)
 
@@ -775,6 +783,73 @@ class KimodoService:
         )
         log.info("  Built Root2D constraint: %d waypoints, frames %s", len(frame_indices), frame_indices)
         return [constraint]
+
+    @staticmethod
+    def _insert_intermediate_waypoints(
+        frame_indices: list[int],
+        root2d_positions: list[list[float]],
+        abs_offset: int,
+    ) -> tuple[list[int], list[list[float]]]:
+        """Insert linearly interpolated waypoints between origin and each far target.
+
+        For each consecutive pair (prev_frame, next_frame) where the gap exceeds
+        CHUNK_SIZE, insert intermediate waypoints so every chunk gets guidance.
+
+        Waypoints are placed at ``prev + k * CHUNK_SIZE - 1`` (one frame before
+        the chunk boundary) so they fall inside the chunk that needs them —
+        ``crop_move`` uses a half-open ``[start, end)`` range.
+
+        The first "prev" is the segment start (abs_offset) at position (0, 0).
+        """
+        if not frame_indices:
+            return frame_indices, root2d_positions
+
+        anchors = list(zip(frame_indices, root2d_positions))
+        anchors.sort(key=lambda a: a[0])
+
+        prev_frame = abs_offset
+        prev_pos = [0.0, 0.0]
+
+        out_frames: list[int] = []
+        out_positions: list[list[float]] = []
+        num_inserted = 0
+
+        for target_frame, target_pos in anchors:
+            gap = target_frame - prev_frame
+            if gap > CHUNK_SIZE:
+                n_steps = gap // CHUNK_SIZE
+                for k in range(1, n_steps + 1):
+                    # Place 1 frame before chunk boundary so it lands inside the
+                    # current chunk's [start, end) range, not the next one's.
+                    inter_frame = prev_frame + k * CHUNK_SIZE - 1
+                    if inter_frame >= target_frame:
+                        break
+                    t = (inter_frame - prev_frame) / gap
+                    inter_pos = [
+                        prev_pos[0] + t * (target_pos[0] - prev_pos[0]),
+                        prev_pos[1] + t * (target_pos[1] - prev_pos[1]),
+                    ]
+                    out_frames.append(inter_frame)
+                    out_positions.append(inter_pos)
+                    num_inserted += 1
+
+            # Keep the original waypoint, clamped to target-1 so it falls
+            # inside the last chunk's half-open [start, end) range.
+            # Skip if an intermediate waypoint already occupies this frame.
+            final_frame = max(target_frame - 1, prev_frame)
+            if not out_frames or out_frames[-1] != final_frame:
+                out_frames.append(final_frame)
+                out_positions.append(target_pos)
+            prev_frame = target_frame
+            prev_pos = target_pos
+
+        if num_inserted > 0:
+            log.info(
+                "  Interpolated %d intermediate waypoints (chunk=%.1fs)",
+                num_inserted, CHUNK_SIZE / 30.0,
+            )
+
+        return out_frames, out_positions
 
     def _build_inbetween_constraint(self, seg, staged_files: dict, origin_offset_2d=None) -> list:
         """Build FullBodyConstraintSet from an inbetween segment.
