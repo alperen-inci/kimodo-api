@@ -774,7 +774,9 @@ class KimodoService:
         # Merge pose anchor positions into the waypoint list so that
         # intermediate waypoints follow the real path through both
         # targets AND pose positions (poses may be off the straight line).
-        if pose_anchors:
+        # Only for multi-chunk segments — single chunk doesn't need extra waypoints.
+        total_seg_frames = seg.end_frame - seg.start_frame
+        if pose_anchors and total_seg_frames > MAX_CHUNK_FRAMES:
             seg_end = seg.end_frame
             for pa_frame, pa_x, pa_z in pose_anchors:
                 if abs_offset <= pa_frame < seg_end and pa_frame not in frame_indices:
@@ -782,6 +784,9 @@ class KimodoService:
                     root2d_positions.append([pa_x, pa_z])
                     log.info("  Pose anchor merged into trajectory: frame %d pos=[%.3f, %.3f]",
                              pa_frame, pa_x, pa_z)
+        elif pose_anchors:
+            log.info("  Skipping pose-anchor merge: segment %d frames ≤ %d (single chunk)",
+                     total_seg_frames, MAX_CHUNK_FRAMES)
 
         # --- Intermediate target interpolation ---
         # Insert linearly interpolated waypoints at chunk boundaries so every
@@ -815,11 +820,23 @@ class KimodoService:
 
         When only poses are provided (no explicit targets), pose root positions
         serve as trajectory waypoints so the character moves through them.
+
+        Only applies for multi-chunk segments (> MAX_CHUNK_FRAMES).  For single-chunk
+        segments (e.g. bridge inbetween), the FullBody constraint alone handles spatial
+        positioning — adding Root2D waypoints would conflict.
         """
         from kimodo.constraints import Root2DConstraintSet
 
         abs_offset = seg.start_frame
         seg_end = seg.end_frame
+        total_seg_frames = seg_end - abs_offset
+
+        # Single chunk: FullBody constraint is sufficient, skip trajectory
+        if total_seg_frames <= MAX_CHUNK_FRAMES:
+            log.info("  Skipping pose-anchor trajectory: segment %d frames ≤ %d (single chunk)",
+                     total_seg_frames, MAX_CHUNK_FRAMES)
+            return []
+
         frame_indices = []
         root2d_positions = []
 
