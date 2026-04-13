@@ -7,6 +7,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+import math
 import os
 import threading
 import time
@@ -72,7 +73,11 @@ def _expand_comma_segments(
 def _split_long_segments(
     texts: list[str], num_frames: list[int],
 ) -> tuple[list[str], list[int], bool]:
-    """Split any segment exceeding *MAX_CHUNK_FRAMES* into ≤ *CHUNK_SIZE* pieces.
+    """Split any segment exceeding *MAX_CHUNK_FRAMES* into balanced pieces.
+
+    Instead of greedy chunking (300, 300, ..., tiny-tail), this divides
+    frames evenly across ``ceil(nf / MAX_CHUNK_FRAMES)`` chunks so every
+    chunk stays within the model's quality sweet-spot (~5-10 s).
 
     Returns (texts_out, num_frames_out, did_chunk).
     """
@@ -86,26 +91,21 @@ def _split_long_segments(
             out_frames.append(nf)
             continue
 
-        # Build chunks of CHUNK_SIZE; last piece gets the remainder.
         did_chunk = True
+        n_chunks = math.ceil(nf / MAX_CHUNK_FRAMES)
+        base = nf // n_chunks
+        extra = nf % n_chunks
         chunks: list[int] = []
-        remaining = nf
-        while remaining > MAX_CHUNK_FRAMES:
-            chunks.append(CHUNK_SIZE)
-            remaining -= CHUNK_SIZE
-        # Remaining tail
-        if remaining > 0:
-            if remaining < MIN_CHUNK_FRAMES and chunks:
-                chunks[-1] += remaining  # merge tiny tail into prev chunk
-            else:
-                chunks.append(remaining)
+        for i in range(n_chunks):
+            # Distribute leftover frames across the first 'extra' chunks
+            chunks.append(base + (1 if i < extra else 0))
 
         for c in chunks:
             out_texts.append(text)
             out_frames.append(c)
 
         log.info(
-            "  Auto-chunked '%s' (%d frames / %.1fs) → %d chunks %s",
+            "  Balanced-chunked '%s' (%d frames / %.1fs) → %d chunks %s",
             text[:50], nf, nf / 30.0, len(chunks), chunks,
         )
 
@@ -712,6 +712,7 @@ class KimodoService:
     def build_constraints(
         self, segments: list, coord_in: str = "lzyx", staged_files: dict | None = None,
         origin_offset_2d: "torch.Tensor | None" = None,
+        pose_anchors: list | None = None,
     ) -> list:
         """Build kimodo constraint objects from parsed segment specs.
 
@@ -719,6 +720,11 @@ class KimodoService:
         When history is used, the model generates at origin. All constraints must be
         translated by origin_offset_2d (the history's root position in Y-up XZ plane)
         so they're in the same origin-centered frame.
+
+        ``pose_anchors`` is a list of ``(abs_frame, x_yup, z_yup)`` tuples extracted
+        from external pose NPZs.  These are merged into the trajectory waypoint
+        anchors so that intermediate waypoints follow the real path through both
+        targets and pose positions.
         """
         _ensure_kimodo_imports()
         from kimodo.constraints import FullBodyConstraintSet, Root2DConstraintSet
@@ -732,7 +738,14 @@ class KimodoService:
 
         for seg in segments:
             if seg.type.value == "trajectory":
-                constraints.extend(self._build_trajectory_constraint(seg, lzyx_root2d, origin_offset_2d))
+                constraints.extend(self._build_trajectory_constraint(
+                    seg, lzyx_root2d, origin_offset_2d, pose_anchors=pose_anchors))
+
+            elif seg.type.value == "text" and pose_anchors:
+                # Text segment with pose anchors: build trajectory waypoints
+                # from pose root positions so character moves through them.
+                constraints.extend(self._build_trajectory_from_pose_anchors(
+                    seg, pose_anchors, origin_offset_2d))
 
             elif seg.type.value == "inbetween":
                 constraints.extend(
@@ -741,7 +754,8 @@ class KimodoService:
 
         return constraints
 
-    def _build_trajectory_constraint(self, seg, lzyx_root2d, origin_offset_2d=None) -> list:
+    def _build_trajectory_constraint(self, seg, lzyx_root2d, origin_offset_2d=None,
+                                     pose_anchors: list | None = None) -> list:
         from kimodo.constraints import Root2DConstraintSet
 
         abs_offset = seg.start_frame
@@ -757,13 +771,25 @@ class KimodoService:
         if not frame_indices:
             return []
 
+        # Merge pose anchor positions into the waypoint list so that
+        # intermediate waypoints follow the real path through both
+        # targets AND pose positions (poses may be off the straight line).
+        if pose_anchors:
+            seg_end = seg.end_frame
+            for pa_frame, pa_x, pa_z in pose_anchors:
+                if abs_offset <= pa_frame < seg_end and pa_frame not in frame_indices:
+                    frame_indices.append(pa_frame)
+                    root2d_positions.append([pa_x, pa_z])
+                    log.info("  Pose anchor merged into trajectory: frame %d pos=[%.3f, %.3f]",
+                             pa_frame, pa_x, pa_z)
+
         # --- Intermediate target interpolation ---
-        # When a waypoint is far away (multiple chunks), the character has no
-        # guidance in earlier chunks and wanders.  Insert linearly interpolated
-        # intermediate waypoints at every CHUNK_SIZE interval so each chunk
-        # gets a trajectory hint pointing toward the final target.
+        # Insert linearly interpolated waypoints at chunk boundaries so every
+        # chunk gets trajectory guidance.  Anchors now include both user targets
+        # and pose root positions.
+        total_seg_frames = seg.end_frame - seg.start_frame
         frame_indices, root2d_positions = self._insert_intermediate_waypoints(
-            frame_indices, root2d_positions, abs_offset)
+            frame_indices, root2d_positions, abs_offset, total_seg_frames)
 
         device = self.skeleton.device if hasattr(self.skeleton, "device") else "cpu"
         root2d_t = torch.tensor(root2d_positions, dtype=torch.float32, device=device)
@@ -784,25 +810,96 @@ class KimodoService:
         log.info("  Built Root2D constraint: %d waypoints, frames %s", len(frame_indices), frame_indices)
         return [constraint]
 
+    def _build_trajectory_from_pose_anchors(self, seg, pose_anchors, origin_offset_2d=None) -> list:
+        """Build Root2DConstraintSet from pose anchor positions for a text segment.
+
+        When only poses are provided (no explicit targets), pose root positions
+        serve as trajectory waypoints so the character moves through them.
+        """
+        from kimodo.constraints import Root2DConstraintSet
+
+        abs_offset = seg.start_frame
+        seg_end = seg.end_frame
+        frame_indices = []
+        root2d_positions = []
+
+        for pa_frame, pa_x, pa_z in pose_anchors:
+            if abs_offset <= pa_frame < seg_end:
+                frame_indices.append(pa_frame)
+                root2d_positions.append([pa_x, pa_z])
+
+        if not frame_indices:
+            return []
+
+        log.info("  Building trajectory from %d pose anchor(s)", len(frame_indices))
+
+        total_seg_frames = seg_end - abs_offset
+        frame_indices, root2d_positions = self._insert_intermediate_waypoints(
+            frame_indices, root2d_positions, abs_offset, total_seg_frames)
+
+        device = self.skeleton.device if hasattr(self.skeleton, "device") else "cpu"
+        root2d_t = torch.tensor(root2d_positions, dtype=torch.float32, device=device)
+
+        if origin_offset_2d is not None:
+            offset = origin_offset_2d.to(device=device, dtype=torch.float32)
+            root2d_t = root2d_t - offset.unsqueeze(0)
+
+        constraint = Root2DConstraintSet(
+            self.skeleton,
+            frame_indices=torch.tensor(frame_indices, dtype=torch.long, device=device),
+            smooth_root_2d=root2d_t,
+        )
+        log.info("  Built Root2D from pose anchors: %d waypoints, frames %s",
+                 len(frame_indices), frame_indices)
+        return [constraint]
+
+    @staticmethod
+    def _compute_chunk_boundaries(total_frames: int) -> list[int]:
+        """Return absolute frame indices where balanced chunks start.
+
+        Mirrors the logic in ``_split_long_segments`` so that intermediate
+        waypoints land inside the correct chunks.
+
+        Example: 750 frames → chunks [250, 250, 250] → boundaries [0, 250, 500]
+        """
+        if total_frames <= MAX_CHUNK_FRAMES:
+            return [0]
+        n_chunks = math.ceil(total_frames / MAX_CHUNK_FRAMES)
+        base = total_frames // n_chunks
+        extra = total_frames % n_chunks
+        boundaries = []
+        cursor = 0
+        for i in range(n_chunks):
+            boundaries.append(cursor)
+            cursor += base + (1 if i < extra else 0)
+        return boundaries
+
     @staticmethod
     def _insert_intermediate_waypoints(
         frame_indices: list[int],
         root2d_positions: list[list[float]],
         abs_offset: int,
+        total_segment_frames: int = 0,
     ) -> tuple[list[int], list[list[float]]]:
-        """Insert linearly interpolated waypoints between origin and each far target.
+        """Insert linearly interpolated waypoints at chunk boundaries.
 
-        For each consecutive pair (prev_frame, next_frame) where the gap exceeds
-        CHUNK_SIZE, insert intermediate waypoints so every chunk gets guidance.
-
-        Waypoints are placed at ``prev + k * CHUNK_SIZE - 1`` (one frame before
-        the chunk boundary) so they fall inside the chunk that needs them —
-        ``crop_move`` uses a half-open ``[start, end)`` range.
+        Computes the balanced chunk boundaries for the segment's total frame
+        count, then ensures every chunk that falls between two user waypoints
+        gets an interpolated target at the boundary so the model has guidance
+        in every chunk.
 
         The first "prev" is the segment start (abs_offset) at position (0, 0).
         """
         if not frame_indices:
             return frame_indices, root2d_positions
+
+        # Compute where chunks will actually split
+        if total_segment_frames > MAX_CHUNK_FRAMES:
+            chunk_bounds = KimodoService._compute_chunk_boundaries(total_segment_frames)
+            # Convert to absolute frames
+            chunk_bounds = [abs_offset + b for b in chunk_bounds]
+        else:
+            chunk_bounds = []
 
         anchors = list(zip(frame_indices, root2d_positions))
         anchors.sort(key=lambda a: a[0])
@@ -816,14 +913,13 @@ class KimodoService:
 
         for target_frame, target_pos in anchors:
             gap = target_frame - prev_frame
-            if gap > CHUNK_SIZE:
-                n_steps = gap // CHUNK_SIZE
-                for k in range(1, n_steps + 1):
-                    # Place 1 frame before chunk boundary so it lands inside the
-                    # current chunk's [start, end) range, not the next one's.
-                    inter_frame = prev_frame + k * CHUNK_SIZE - 1
-                    if inter_frame >= target_frame:
-                        break
+            if gap > 0 and chunk_bounds:
+                # Insert at every chunk boundary that falls between prev and target
+                for cb in chunk_bounds:
+                    # Place 1 frame before boundary so it lands inside the chunk
+                    inter_frame = cb - 1
+                    if inter_frame <= prev_frame or inter_frame >= target_frame:
+                        continue
                     t = (inter_frame - prev_frame) / gap
                     inter_pos = [
                         prev_pos[0] + t * (target_pos[0] - prev_pos[0]),
@@ -833,9 +929,7 @@ class KimodoService:
                     out_positions.append(inter_pos)
                     num_inserted += 1
 
-            # Keep the original waypoint, clamped to target-1 so it falls
-            # inside the last chunk's half-open [start, end) range.
-            # Skip if an intermediate waypoint already occupies this frame.
+            # Keep the original waypoint
             final_frame = max(target_frame - 1, prev_frame)
             if not out_frames or out_frames[-1] != final_frame:
                 out_frames.append(final_frame)
@@ -845,8 +939,8 @@ class KimodoService:
 
         if num_inserted > 0:
             log.info(
-                "  Interpolated %d intermediate waypoints (chunk=%.1fs)",
-                num_inserted, CHUNK_SIZE / 30.0,
+                "  Interpolated %d intermediate waypoints at chunk boundaries, total %d waypoints",
+                num_inserted, len(out_frames),
             )
 
         return out_frames, out_positions
@@ -978,3 +1072,129 @@ class KimodoService:
 
         log.info("  Built FullBody constraint: %d keyframes at abs frames %s", len(abs_frames), abs_frames)
         return [constraint]
+
+    def extract_pose_root2d(
+        self,
+        pose_constraints: list,
+        staged_files: dict,
+        frame_offset: int = 0,
+        coord_in: str = "lzyx",
+    ) -> list[tuple[int, float, float]]:
+        """Extract root 2D positions from pose NPZs (lightweight, no FK).
+
+        Returns list of ``(abs_frame, x_yup, z_yup)`` tuples that can be used
+        as additional anchors for trajectory waypoint interpolation.
+        """
+        from .coord import M_INV, lzyx_root2d
+
+        results = []
+        for pc in pose_constraints:
+            if pc.file_name not in staged_files:
+                continue
+            ref_data = np.load(staged_files[pc.file_name], allow_pickle=True)
+            ref_trans = ref_data["trans"]  # (T, 3) in Z-up lzyx
+            src_frame = pc.smplx_src_frame
+            if src_frame >= ref_trans.shape[0]:
+                continue
+
+            # Get root position and convert lzyx → Y-up 2D
+            pos_zup = ref_trans[src_frame]  # [x, y, z] in lzyx (Z-up)
+            # lzyx_root2d extracts 2D root from lzyx coords
+            rx, rz = lzyx_root2d(pos_zup[0], pos_zup[1])
+            abs_frame = pc.frame + frame_offset
+            results.append((abs_frame, rx, rz))
+
+        return results
+
+    def build_pose_constraints(
+        self,
+        pose_constraints: list,
+        staged_files: dict,
+        frame_offset: int = 0,
+        origin_offset_2d: "torch.Tensor | None" = None,
+    ) -> list:
+        """Build FullBodyConstraintSet(s) from ExternalPoseConstraint entries.
+
+        Each entry specifies a single frame + an uploaded NPZ.  The constraints
+        are returned as a flat list so they can be appended to ``constraint_lst``
+        and applied on top of trajectory or text segments.
+        """
+        _ensure_kimodo_imports()
+        from kimodo.constraints import FullBodyConstraintSet
+        from kimodo.geometry import axis_angle_to_matrix
+        from kimodo.skeleton import fk
+
+        from .coord import M_INV
+
+        constraints = []
+        for pc in pose_constraints:
+            if pc.file_name not in staged_files:
+                raise ValueError(
+                    f"pose_constraint references '{pc.file_name}' but it was not uploaded"
+                )
+
+            ref_data = np.load(staged_files[pc.file_name], allow_pickle=True)
+            ref_poses = ref_data["poses"]   # (T, 165)
+            ref_trans = ref_data["trans"]    # (T, 3)
+
+            src_frame = pc.smplx_src_frame
+            if src_frame >= ref_poses.shape[0]:
+                raise ValueError(
+                    f"smplx_src_frame {src_frame} out of range [0, {ref_poses.shape[0]})"
+                )
+
+            # Extract single frame
+            kf_poses = ref_poses[src_frame:src_frame + 1]   # (1, 165)
+            kf_trans = ref_trans[src_frame:src_frame + 1]    # (1, 3)
+
+            n_body_joints = (
+                int(ref_data["n_body_joints"]) if "n_body_joints" in ref_data
+                else (ref_poses.shape[-1] - 3 - 99) // 3  # same heuristic as _build_inbetween_constraint
+            )
+            kf_root_aa = kf_poses[:, :3]
+            kf_body_aa = kf_poses[:, 3:3 + n_body_joints * 3].reshape(1, n_body_joints, 3)
+            kf_all_aa = np.concatenate([kf_root_aa[:, np.newaxis, :], kf_body_aa], axis=1)
+
+            # Z-up → Y-up
+            pelvis_offset = self.skeleton.neutral_joints[self.skeleton.root_idx].cpu().numpy()
+            trans_yup = np.matmul(kf_trans + pelvis_offset, M_INV.T) - pelvis_offset
+            root_positions = (trans_yup + pelvis_offset).astype(np.float32)
+
+            root_rots_mat = axis_angle_to_matrix(
+                torch.tensor(kf_all_aa[:, 0], dtype=torch.float32)
+            ).numpy()
+            root_rots_yup = np.matmul(M_INV.T, root_rots_mat)
+            body_rots = axis_angle_to_matrix(
+                torch.tensor(kf_all_aa[:, 1:], dtype=torch.float32)
+            ).numpy()
+            local_rot_mats = np.concatenate(
+                [root_rots_yup[:, np.newaxis, :, :], body_rots], axis=1
+            ).astype(np.float32)
+
+            device = self.skeleton.device if hasattr(self.skeleton, "device") else "cpu"
+            local_rots_t = torch.tensor(local_rot_mats, dtype=torch.float32, device=device)
+            root_pos_t = torch.tensor(root_positions, dtype=torch.float32, device=device)
+            global_rots, posed_joints, _ = fk(local_rots_t, root_pos_t, self.skeleton)
+
+            smooth_root_2d = posed_joints[:, self.skeleton.root_idx, [0, 2]]
+
+            # Translate to origin
+            if origin_offset_2d is not None:
+                offset = origin_offset_2d.to(device=device, dtype=torch.float32)
+                posed_joints[:, :, 0] -= offset[0]
+                posed_joints[:, :, 2] -= offset[1]
+                smooth_root_2d = smooth_root_2d - offset.unsqueeze(0)
+
+            abs_frame = pc.frame + frame_offset
+            constraint = FullBodyConstraintSet(
+                self.skeleton,
+                frame_indices=torch.tensor([abs_frame], dtype=torch.long, device=device),
+                global_joints_positions=posed_joints,
+                global_joints_rots=global_rots,
+                smooth_root_2d=smooth_root_2d,
+            )
+            constraints.append(constraint)
+            log.info("  Built external pose constraint at abs frame %d (from %s frame %d)",
+                     abs_frame, pc.file_name, src_frame)
+
+        return constraints

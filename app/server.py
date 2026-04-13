@@ -177,6 +177,7 @@ async def generate_timeline(
         # Pass origin offset so trajectory/inbetween constraints are translated
         # to the same origin-centered frame as history constraints.
         origin_offset_2d = None
+        num_over = 0
         if history_info:
             import torch
             origin_offset_2d = torch.tensor(
@@ -187,16 +188,50 @@ async def generate_timeline(
             for seg in spec.segments:
                 seg.start_frame += num_over
                 seg.end_frame += num_over
+
+        # Extract root 2D positions from pose NPZs BEFORE building trajectory
+        # constraints so that intermediate waypoints follow the real path
+        # through both targets and pose positions.
+        pose_anchors = []
+        if spec.pose_constraints:
+            pose_anchors = service.extract_pose_root2d(
+                spec.pose_constraints,
+                staged_files=staged_files,
+                frame_offset=num_over,
+                coord_in=spec.coord_in,
+            )
+            log.info("[%s] Extracted %d pose anchor(s) for trajectory: %s",
+                     req_id, len(pose_anchors),
+                     [(f, f"{x:.3f},{z:.3f}") for f, x, z in pose_anchors])
+
         try:
             segment_constraints = service.build_constraints(
                 spec.segments, coord_in=spec.coord_in, staged_files=staged_files,
                 origin_offset_2d=origin_offset_2d,
+                pose_anchors=pose_anchors,
             )
         except Exception as e:
             log.error("[%s] Failed to build constraints: %s", req_id, e)
             raise HTTPException(status_code=400, detail="Constraint error")
 
         constraint_lst = history_constraints + segment_constraints
+
+        # ---- Build external pose constraints (overlay on segments) ----
+        if spec.pose_constraints:
+            try:
+                num_over = history_info["num_over_generate"] if history_info else 0
+                pose_constraints = service.build_pose_constraints(
+                    spec.pose_constraints,
+                    staged_files=staged_files,
+                    frame_offset=num_over,
+                    origin_offset_2d=origin_offset_2d,
+                )
+                constraint_lst.extend(pose_constraints)
+                log.info("[%s] Pose constraints: %d external pose keyframe(s)",
+                         req_id, len(spec.pose_constraints))
+            except Exception as e:
+                log.error("[%s] Failed to build pose constraints: %s", req_id, e)
+                raise HTTPException(status_code=400, detail="Pose constraint error")
 
         # ---- Generate ----
         try:

@@ -128,6 +128,25 @@ class SegmentSpec(BaseModel):
         return self
 
 
+class ExternalPoseConstraint(BaseModel):
+    """A full-body pose constraint applied at a specific absolute frame.
+
+    This allows placing pose keyframes *on top of* any segment type
+    (including trajectory segments), so targets and poses can coexist
+    within a single generation span without splitting into separate segments.
+
+    Upload the reference NPZ via multipart ``files`` and reference it here
+    by ``file_name``.
+    """
+
+    frame: int = Field(..., ge=0, description="Absolute frame index in the full timeline")
+    file_name: str = Field(..., description="Uploaded NPZ filename (must match multipart upload)")
+    smplx_src_frame: int = Field(
+        0, ge=0,
+        description="Which frame inside the reference NPZ to use as the constraint pose",
+    )
+
+
 class HistorySpec(BaseModel):
     """History motion for continuation.
 
@@ -201,6 +220,16 @@ class TimelineSpec(BaseModel):
     # --- transition ---
     num_transition_frames: int = Field(
         5, ge=0, le=30, description="Transition blend frames between segments"
+    )
+
+    # --- external pose constraints (overlay on any segment type) ---
+    pose_constraints: Optional[list[ExternalPoseConstraint]] = Field(
+        None,
+        description=(
+            "Full-body pose keyframes applied on top of any segment. "
+            "Allows mixing trajectory waypoints and pose keyframes in a "
+            "single generation span without splitting into separate segments."
+        ),
     )
 
     # --- segments ---
