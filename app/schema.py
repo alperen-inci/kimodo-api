@@ -55,7 +55,7 @@ class SegmentSpec(BaseModel):
 
     # --- common ---
     text: str = Field(
-        ..., min_length=1, description="Motion description for text conditioning"
+        "", description="Motion description for text conditioning. Empty string for constraint-only generation."
     )
 
     # --- trajectory-specific ---
