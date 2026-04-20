@@ -21,6 +21,7 @@ import tempfile
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse, Response
 
+from . import body2hands as body2hands_client
 from .schema import HealthResponse, SegmentType, TimelineSpec
 from .service import KimodoService
 
@@ -42,6 +43,10 @@ log = logging.getLogger("kimodo_api")
 DEVICE = os.environ.get("KIMODO_DEVICE", "cuda")
 MODEL_NAME = os.environ.get("KIMODO_MODEL", "smplx")
 
+BODY2HANDS_URL = os.environ.get("KIMODO_BODY2HANDS_URL", "http://localhost:8021")
+BODY2HANDS_ENABLED = os.environ.get("KIMODO_BODY2HANDS_ENABLED", "true").lower() == "true"
+BODY2HANDS_TIMEOUT_SEC = float(os.environ.get("KIMODO_BODY2HANDS_TIMEOUT_SEC", "120"))
+
 app = FastAPI(
     title="Kimodo Motion Generation API",
     version="1.0.0",
@@ -56,6 +61,10 @@ service = KimodoService(model_name=MODEL_NAME, device=DEVICE)
 @app.on_event("startup")
 async def startup():
     log.info("Starting Kimodo API — model=%s, device=%s", MODEL_NAME, DEVICE)
+    log.info(
+        "Body2Hands post-processing: enabled=%s url=%s timeout=%.0fs",
+        BODY2HANDS_ENABLED, BODY2HANDS_URL, BODY2HANDS_TIMEOUT_SEC,
+    )
     try:
         service.load()
     except Exception:
@@ -68,10 +77,26 @@ async def startup():
 @app.get("/health", response_model=HealthResponse)
 async def health():
     """Check service health and model readiness."""
+    b2h_info: dict = {"enabled": BODY2HANDS_ENABLED, "url": BODY2HANDS_URL}
+    if BODY2HANDS_ENABLED:
+        b2h_health = await body2hands_client.health(BODY2HANDS_URL, timeout=3.0)
+        if b2h_health is None:
+            b2h_info.update(reachable=False, model_loaded=False)
+        else:
+            b2h_info.update(
+                reachable=True,
+                model_loaded=bool(b2h_health.get("model_loaded")),
+                device=b2h_health.get("device"),
+                checkpoint=b2h_health.get("checkpoint"),
+            )
+
     if service.is_loaded:
-        return HealthResponse(status="ok", model_loaded=True)
+        return HealthResponse(status="ok", model_loaded=True, body2hands=b2h_info)
     else:
-        return HealthResponse(status="not_ready", model_loaded=False, detail="Model not loaded")
+        return HealthResponse(
+            status="not_ready", model_loaded=False,
+            detail="Model not loaded", body2hands=b2h_info,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -267,6 +292,33 @@ async def generate_timeline(
             import shutil
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
+    # ---- Body2Hands post-processing ----
+    # Enrich hand channels only. On ANY failure (unreachable, timeout, bad
+    # response, shape mismatch) fall through with the original kimodo NPZ so
+    # the user still gets a valid motion — the X-Kimodo-Body2Hands header
+    # makes the outcome explicit (no silent behavior change).
+    b2h_status = "disabled"
+    if BODY2HANDS_ENABLED:
+        t_b2h = time.time()
+        enriched = await body2hands_client.enrich(
+            BODY2HANDS_URL, result["npz_bytes"], timeout=BODY2HANDS_TIMEOUT_SEC,
+        )
+        if enriched is None:
+            b2h_status = "skipped:unreachable_or_failed"
+            log.warning("[%s] Body2Hands: %s — returning kimodo output unchanged",
+                        req_id, b2h_status)
+        else:
+            spliced = body2hands_client.splice_hands_only(result["npz_bytes"], enriched)
+            if spliced is None:
+                b2h_status = "skipped:shape_mismatch"
+                log.warning("[%s] Body2Hands: %s — returning kimodo output unchanged",
+                            req_id, b2h_status)
+            else:
+                result["npz_bytes"] = spliced
+                b2h_status = "applied"
+                log.info("[%s] Body2Hands: applied in %.1fs (%d bytes)",
+                         req_id, time.time() - t_b2h, len(spliced))
+
     # ---- Return NPZ ----
     filename = f"motion_{req_id}.npz"
     return Response(
@@ -274,6 +326,7 @@ async def generate_timeline(
         media_type="application/octet-stream",
         headers={
             "Content-Disposition": f'attachment; filename="{filename}"',
+            "X-Kimodo-Body2Hands": b2h_status,
             "X-Kimodo-Meta": json.dumps({
                 k: v for k, v in result["meta"].items()
                 if k in ("total_frames", "fps", "elapsed_sec")

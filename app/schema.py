@@ -268,3 +268,4 @@ class HealthResponse(BaseModel):
     status: str
     model_loaded: bool
     detail: Optional[str] = None
+    body2hands: Optional[dict] = None
