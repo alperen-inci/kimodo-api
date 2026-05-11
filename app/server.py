@@ -229,11 +229,31 @@ async def generate_timeline(
                      req_id, len(pose_anchors),
                      [(f, f"{x:.3f},{z:.3f}") for f, x, z in pose_anchors])
 
+        # ---- Pre-compute dense smooth paths per segment ----
+        # Merges trajectory waypoints + Full-Body root anchors (inbetween FK
+        # roots + external pose roots), then ADMM-smooths each segment globally
+        # so subsequent chunking only slices the dense curve (no per-chunk
+        # discontinuities, matches demo's "Make Smooth Path").
+        try:
+            dense_paths = service.precompute_dense_paths(
+                segments=spec.segments,
+                pose_anchors=pose_anchors,
+                staged_files=staged_files,
+                enabled=bool(spec.dense_path),
+            )
+            if dense_paths:
+                log.info("[%s] Dense-path: %d/%d segment(s) densified",
+                         req_id, len(dense_paths), len(spec.segments))
+        except Exception as e:
+            log.warning("[%s] Dense-path precompute failed (%s); falling back to sparse", req_id, e)
+            dense_paths = {}
+
         try:
             segment_constraints = service.build_constraints(
                 spec.segments, coord_in=spec.coord_in, staged_files=staged_files,
                 origin_offset_2d=origin_offset_2d,
                 pose_anchors=pose_anchors,
+                dense_paths=dense_paths,
             )
         except Exception as e:
             log.error("[%s] Failed to build constraints: %s", req_id, e)
@@ -250,6 +270,8 @@ async def generate_timeline(
                     staged_files=staged_files,
                     frame_offset=num_over,
                     origin_offset_2d=origin_offset_2d,
+                    segments=spec.segments,
+                    dense_paths=dense_paths,
                 )
                 constraint_lst.extend(pose_constraints)
                 log.info("[%s] Pose constraints: %d external pose keyframe(s)",

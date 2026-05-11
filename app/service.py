@@ -27,6 +27,16 @@ MAX_CHUNK_FRAMES = int(os.environ.get("KIMODO_MAX_CHUNK_FRAMES", "300"))   # 10s
 CHUNK_SIZE = int(os.environ.get("KIMODO_CHUNK_SIZE", "300"))               # 10s @ 30fps
 MIN_CHUNK_FRAMES = 60  # avoid tiny tail chunks (< 2s)
 
+# Dense-path mode (matches demo's "Make Smooth Path").
+# Margin is the soft-constraint slack used by the ADMM smoother — same default
+# as kimodo.motion_rep.smooth_root.get_smooth_root_pos. Conflicts between a
+# trajectory waypoint and a Full-Body root anchor at the same frame are
+# resolved by FullBody winning; a warning is logged if they disagree beyond
+# DENSE_PATH_CONFLICT_WARN_M.
+DENSE_PATH_MARGIN_M = 0.06
+DENSE_PATH_MIN_ANCHORS_FOR_SMOOTH = 3  # 2 anchors → linear only; 3+ → ADMM
+DENSE_PATH_CONFLICT_WARN_M = 0.10
+
 
 def _split_long_segments(
     texts: list[str], num_frames: list[int],
@@ -670,6 +680,7 @@ class KimodoService:
         self, segments: list, coord_in: str = "lzyx", staged_files: dict | None = None,
         origin_offset_2d: "torch.Tensor | None" = None,
         pose_anchors: list | None = None,
+        dense_paths: "dict[int, np.ndarray] | None" = None,
     ) -> list:
         """Build kimodo constraint objects from parsed segment specs.
 
@@ -691,29 +702,52 @@ class KimodoService:
         from .coord import lzyx_root2d
 
         staged_files = staged_files or {}
+        dense_paths = dense_paths or {}
         constraints = []
 
-        for seg in segments:
+        for i, seg in enumerate(segments):
+            dense_path = dense_paths.get(i)
             if seg.type.value == "trajectory":
                 constraints.extend(self._build_trajectory_constraint(
-                    seg, lzyx_root2d, origin_offset_2d, pose_anchors=pose_anchors))
+                    seg, lzyx_root2d, origin_offset_2d, pose_anchors=pose_anchors,
+                    dense_path=dense_path))
 
-            elif seg.type.value == "text" and pose_anchors:
-                # Text segment with pose anchors: build trajectory waypoints
-                # from pose root positions so character moves through them.
-                constraints.extend(self._build_trajectory_from_pose_anchors(
-                    seg, pose_anchors, origin_offset_2d))
+            elif seg.type.value == "text":
+                if dense_path is not None:
+                    # Dense mode covers text segments uniformly via per-frame
+                    # Root2D — no separate pose-anchor trajectory needed.
+                    constraints.extend(self._build_dense_root2d_constraint(
+                        seg, dense_path, origin_offset_2d))
+                elif pose_anchors:
+                    constraints.extend(self._build_trajectory_from_pose_anchors(
+                        seg, pose_anchors, origin_offset_2d))
 
             elif seg.type.value == "inbetween":
                 constraints.extend(
-                    self._build_inbetween_constraint(seg, staged_files, origin_offset_2d)
+                    self._build_inbetween_constraint(
+                        seg, staged_files, origin_offset_2d,
+                        dense_path=dense_path,
+                    )
                 )
+                if dense_path is not None:
+                    # Inbetween already adds a FullBody constraint at its
+                    # destination frames; also lay down the per-frame
+                    # Root2D so the path is followed between them.
+                    constraints.extend(self._build_dense_root2d_constraint(
+                        seg, dense_path, origin_offset_2d))
 
         return constraints
 
     def _build_trajectory_constraint(self, seg, lzyx_root2d, origin_offset_2d=None,
-                                     pose_anchors: list | None = None) -> list:
+                                     pose_anchors: list | None = None,
+                                     dense_path: "np.ndarray | None" = None) -> list:
         from kimodo.constraints import Root2DConstraintSet
+
+        # Dense mode: one Root2DConstraintSet covering every frame of the
+        # segment with the pre-computed smoothed path. Skip the per-chunk
+        # interp shim entirely — every chunk already has per-frame guidance.
+        if dense_path is not None:
+            return self._build_dense_root2d_constraint(seg, dense_path, origin_offset_2d)
 
         abs_offset = seg.start_frame
         frame_indices = []
@@ -770,6 +804,50 @@ class KimodoService:
             smooth_root_2d=root2d_t,
         )
         log.info("  Built Root2D constraint: %d waypoints, frames %s", len(frame_indices), frame_indices)
+        return [constraint]
+
+    def _build_dense_root2d_constraint(
+        self, seg, dense_path: "np.ndarray", origin_offset_2d=None,
+    ) -> list:
+        """Build a single Root2DConstraintSet with per-frame XZ guidance.
+
+        ``dense_path`` is segment-local ``(seg_len, 2)`` in Y-up. Frame indices
+        in the resulting constraint are absolute (``[seg.start_frame,
+        seg.end_frame)``); ``_multiprompt.crop_move`` slices them per chunk.
+        """
+        from kimodo.constraints import Root2DConstraintSet
+
+        seg_len = seg.end_frame - seg.start_frame
+        if dense_path.shape[0] != seg_len:
+            raise ValueError(
+                f"dense_path length {dense_path.shape[0]} does not match "
+                f"segment length {seg_len}"
+            )
+
+        device = self.skeleton.device if hasattr(self.skeleton, "device") else "cpu"
+        xz = torch.from_numpy(np.ascontiguousarray(dense_path)).to(
+            device=device, dtype=torch.float32
+        )
+        if origin_offset_2d is not None:
+            offset = origin_offset_2d.to(device=device, dtype=torch.float32)
+            xz = xz - offset.unsqueeze(0)
+            log.info(
+                "  Dense Root2D[seg @ frame %d..%d]: translated by offset=[%.3f, %.3f]",
+                seg.start_frame, seg.end_frame,
+                float(offset[0].item()), float(offset[1].item()),
+            )
+        frame_indices = torch.arange(
+            seg.start_frame, seg.end_frame, dtype=torch.long, device=device,
+        )
+        constraint = Root2DConstraintSet(
+            self.skeleton,
+            frame_indices=frame_indices,
+            smooth_root_2d=xz,
+        )
+        log.info(
+            "  Built dense Root2D constraint: %d frames [%d, %d)",
+            seg_len, seg.start_frame, seg.end_frame,
+        )
         return [constraint]
 
     def _build_trajectory_from_pose_anchors(self, seg, pose_anchors, origin_offset_2d=None) -> list:
@@ -919,7 +997,248 @@ class KimodoService:
 
         return out_frames, out_positions
 
-    def _build_inbetween_constraint(self, seg, staged_files: dict, origin_offset_2d=None) -> list:
+    # ------------------------------------------------------------------
+    # Dense-path computation (mirrors demo's "Make Smooth Path")
+    # ------------------------------------------------------------------
+    def _compute_dense_path(
+        self,
+        anchor_local_frames: list[int],
+        anchor_xz_yup: list[list[float]],
+        seg_len: int,
+        smooth: bool = True,
+    ) -> "np.ndarray | None":
+        """Build a per-frame dense XZ trajectory for one segment.
+
+        Args:
+            anchor_local_frames: segment-local frame indices in ``[0, seg_len)``.
+            anchor_xz_yup: matching ``[x, z]`` positions in Kimodo Y-up.
+            seg_len: total frames in the segment.
+            smooth: if True and there are >= 3 anchors, apply the ADMM smoother
+                (``kimodo.motion_rep.smooth_root.smooth_signal`` with margin
+                ``DENSE_PATH_MARGIN_M``).
+
+        Returns:
+            ``(seg_len, 2)`` float32 array of XZ values, or ``None`` if fewer
+            than 2 unique anchors (sparse mode falls back).
+
+        Auto-bypass: if anchors already cover every frame in ``[0, seg_len)``
+        the supplied values are returned verbatim — no interpolation, no
+        smoothing — so callers that pre-computed a path get exactly what they
+        sent.
+        """
+        if not anchor_local_frames or len(anchor_local_frames) < 2:
+            return None
+
+        # Sort + dedup by frame (keep last write — caller controls ordering)
+        by_frame: dict[int, list[float]] = {}
+        for f, pos in zip(anchor_local_frames, anchor_xz_yup):
+            if 0 <= f < seg_len:
+                by_frame[int(f)] = [float(pos[0]), float(pos[1])]
+        if len(by_frame) < 2:
+            return None
+
+        sorted_frames = np.array(sorted(by_frame.keys()), dtype=np.int64)
+        sorted_xz = np.array([by_frame[f] for f in sorted_frames], dtype=np.float32)
+
+        # Auto-bypass: every frame already provided → trust the caller
+        if (
+            sorted_frames.shape[0] == seg_len
+            and sorted_frames[0] == 0
+            and sorted_frames[-1] == seg_len - 1
+            and (sorted_frames == np.arange(seg_len)).all()
+        ):
+            log.info(
+                "  Dense-path: caller provided %d/%d frames → bypass smoothing",
+                seg_len, seg_len,
+            )
+            return sorted_xz.astype(np.float32)
+
+        # Extend anchors to cover [0, seg_len-1] for interp1d (clamp by repeat)
+        if sorted_frames[0] > 0:
+            sorted_frames = np.concatenate(([0], sorted_frames))
+            sorted_xz = np.concatenate((sorted_xz[:1], sorted_xz), axis=0)
+        if sorted_frames[-1] < seg_len - 1:
+            sorted_frames = np.concatenate((sorted_frames, [seg_len - 1]))
+            sorted_xz = np.concatenate((sorted_xz, sorted_xz[-1:]), axis=0)
+
+        from scipy.interpolate import interp1d
+        t = np.arange(seg_len, dtype=np.int64)
+        dense_x = interp1d(sorted_frames, sorted_xz[:, 0], kind="linear")(t)
+        dense_z = interp1d(sorted_frames, sorted_xz[:, 1], kind="linear")(t)
+        dense = np.stack([dense_x, dense_z], axis=1).astype(np.float32)
+
+        if smooth and len(by_frame) >= DENSE_PATH_MIN_ANCHORS_FOR_SMOOTH:
+            try:
+                from kimodo.motion_rep.smooth_root import smooth_signal
+                margins = np.full(seg_len, DENSE_PATH_MARGIN_M, dtype=np.float32)
+                dense = smooth_signal(dense, margins).astype(np.float32)
+                log.info(
+                    "  Dense-path: %d anchors → %d frames smoothed (ADMM, margin=%.2fm)",
+                    len(by_frame), seg_len, DENSE_PATH_MARGIN_M,
+                )
+            except Exception as e:
+                # If smoothing fails for any reason (e.g., scipy issue),
+                # fall back to the linearly interpolated path rather than
+                # aborting the whole request.
+                log.warning("  Dense-path: ADMM smoothing failed (%s); using linear interp only", e)
+        else:
+            log.info(
+                "  Dense-path: %d anchors → %d frames (linear only, smooth=%s)",
+                len(by_frame), seg_len, smooth,
+            )
+        return dense
+
+    def _extract_inbetween_anchors(
+        self, seg, staged_files: dict
+    ) -> "list[tuple[int, float, float]]":
+        """Pull Full-Body root XZ (Y-up Kimodo) at this inbetween's destination
+        frames from the referenced NPZ — lightweight, no FK.
+
+        Returns ``[(seg_local_frame, x_yup, z_yup), ...]`` matching what
+        ``_build_inbetween_constraint`` would assign to ``smooth_root_2d`` at
+        each constrained frame.
+
+        For standard SMPL-X/SOMA/G1 skeletons the pelvis neutral has zero XZ
+        offset, so ``lzyx_root2d(trans[i,0], trans[i,1])`` equals
+        ``posed_joints[i, root_idx, [0, 2]]`` to numerical precision.
+        """
+        from .coord import lzyx_root2d
+
+        ref_spec = seg.ref_smplx
+        if ref_spec is None or ref_spec.file_name not in staged_files:
+            return []
+        try:
+            ref_data = np.load(staged_files[ref_spec.file_name], allow_pickle=True)
+            ref_trans = ref_data["trans"]
+            ref_T = ref_trans.shape[0]
+        except Exception as e:
+            log.warning("  Could not read inbetween ref '%s' for dense-path anchors: %s",
+                        ref_spec.file_name, e)
+            return []
+
+        n_frames = seg.end_frame - seg.start_frame
+        src_start = ref_spec.smplx_src_start_frame
+        mask_mode = seg.mask_mode or "endpoints"
+
+        if mask_mode == "none":
+            return []
+        elif mask_mode == "endpoints":
+            dest_frames = [0, n_frames - 1]
+            src_frames = [src_start, min(src_start + ref_T - 1, ref_T - 1)]
+        elif mask_mode == "all":
+            actual_len = min(n_frames, ref_T - src_start)
+            dest_frames = list(range(actual_len))
+            src_frames = [src_start + i for i in range(actual_len)]
+        elif mask_mode == "keyframes":
+            dest_frames = list(seg.keyframes or [])
+            src_frames = list(seg.keyframes_src_frames) if seg.keyframes_src_frames \
+                else [src_start + kf for kf in dest_frames]
+        else:
+            return []
+
+        anchors: list[tuple[int, float, float]] = []
+        for df, sf in zip(dest_frames, src_frames):
+            if sf < 0 or sf >= ref_T:
+                continue
+            if df < 0 or df >= n_frames:
+                continue
+            rx, rz = lzyx_root2d(float(ref_trans[sf, 0]), float(ref_trans[sf, 1]))
+            anchors.append((int(df), rx, rz))
+        return anchors
+
+    def precompute_dense_paths(
+        self,
+        segments: list,
+        pose_anchors: "list[tuple[int, float, float]]",
+        staged_files: dict,
+        enabled: bool = True,
+    ) -> "dict[int, np.ndarray]":
+        """Compute one dense per-frame XZ trajectory per segment that has
+        enough anchors.
+
+        Anchors per segment come from:
+          • trajectory points (``seg.points`` for trajectory segments),
+          • Full-Body root XZ from the inbetween's reference NPZ at the
+            destination frames (for inbetween segments),
+          • external pose-constraint root XZ (``pose_anchors``) that fall
+            inside the segment range.
+
+        Full-Body anchors WIN over trajectory anchors at the same segment-local
+        frame; a warning is logged if they disagree beyond
+        ``DENSE_PATH_CONFLICT_WARN_M`` metres.
+
+        Returns ``{segment_index → (seg_len, 2) np.ndarray (Y-up)}`` for
+        every segment with >= 2 unique anchors. Other segments are absent
+        from the returned dict and callers fall back to sparse mode for them.
+        """
+        if not enabled:
+            return {}
+
+        from .coord import lzyx_root2d
+
+        dense_paths: dict[int, np.ndarray] = {}
+        for i, seg in enumerate(segments):
+            seg_start = seg.start_frame
+            seg_end = seg.end_frame
+            seg_len = seg_end - seg_start
+
+            # Step 1: trajectory waypoints (segment-local frames)
+            traj_by_local: dict[int, list[float]] = {}
+            if seg.type.value == "trajectory" and seg.points:
+                for pt in seg.points:
+                    if 0 <= pt.frame < seg_len:
+                        rx, rz = lzyx_root2d(float(pt.pos[0]), float(pt.pos[1]))
+                        traj_by_local[int(pt.frame)] = [rx, rz]
+
+            # Step 2: Full-Body root anchors from inbetween reference NPZ
+            fb_by_local: dict[int, list[float]] = {}
+            if seg.type.value == "inbetween":
+                for local_f, x, z in self._extract_inbetween_anchors(seg, staged_files):
+                    fb_by_local[int(local_f)] = [x, z]
+
+            # Step 3: external pose anchors that fall inside this segment
+            for abs_f, x, z in pose_anchors:
+                if seg_start <= abs_f < seg_end:
+                    local_f = int(abs_f - seg_start)
+                    fb_by_local[local_f] = [x, z]
+
+            # Step 4: merge — Full-Body wins over trajectory on conflict
+            merged: dict[int, list[float]] = dict(traj_by_local)
+            for local_f, fb_xz in fb_by_local.items():
+                if local_f in merged:
+                    dx = fb_xz[0] - merged[local_f][0]
+                    dz = fb_xz[1] - merged[local_f][1]
+                    dist = float(np.hypot(dx, dz))
+                    if dist > DENSE_PATH_CONFLICT_WARN_M:
+                        log.warning(
+                            "  Dense-path: trajectory waypoint at seg=%d local-frame=%d "
+                            "overridden by Full-Body anchor (Δ=%.3fm > %.2fm threshold)",
+                            i, local_f, dist, DENSE_PATH_CONFLICT_WARN_M,
+                        )
+                merged[local_f] = fb_xz
+
+            if len(merged) < 2:
+                if merged:
+                    log.info(
+                        "  Dense-path: segment %d has only %d anchor(s) → sparse mode",
+                        i, len(merged),
+                    )
+                continue
+
+            frames = sorted(merged.keys())
+            xzs = [merged[f] for f in frames]
+            dense = self._compute_dense_path(frames, xzs, seg_len, smooth=True)
+            if dense is not None:
+                dense_paths[i] = dense
+                log.info(
+                    "  Dense-path[seg=%d]: %d anchors → %d-frame dense path "
+                    "(traj=%d, fb=%d)",
+                    i, len(merged), seg_len, len(traj_by_local), len(fb_by_local),
+                )
+        return dense_paths
+
+    def _build_inbetween_constraint(self, seg, staged_files: dict, origin_offset_2d=None,
+                                    dense_path: "np.ndarray | None" = None) -> list:
         """Build FullBodyConstraintSet from an inbetween segment.
 
         Accepts the same request format as DART API:
@@ -1027,6 +1346,23 @@ class KimodoService:
 
         smooth_root_2d = posed_joints[:, self.skeleton.root_idx, [0, 2]]
 
+        # Dense-path override: when a per-frame smooth path is supplied, force
+        # this FullBody's smooth_root_2d to the dense path's value at each
+        # destination frame so the Root2D dense constraint and FullBody agree
+        # bit-for-bit. The pose geometry (joint rotations + global_joints_positions)
+        # is unchanged; only the per-frame root XZ reference shifts.
+        if dense_path is not None:
+            try:
+                local_dest = np.asarray(dest_frames, dtype=np.int64)
+                dense_local = dense_path[local_dest]  # (K, 2) in Y-up
+                smooth_root_2d = torch.from_numpy(
+                    np.ascontiguousarray(dense_local)
+                ).to(device=device, dtype=torch.float32)
+                log.info("  Inbetween smooth_root_2d overridden from dense path "
+                         "at %d frames", len(dest_frames))
+            except Exception as e:
+                log.warning("  Inbetween dense_path override failed (%s); using FK root XZ", e)
+
         # Translate to origin (same as history constraints)
         if origin_offset_2d is not None:
             offset = origin_offset_2d.to(device=device, dtype=torch.float32)
@@ -1086,12 +1422,19 @@ class KimodoService:
         staged_files: dict,
         frame_offset: int = 0,
         origin_offset_2d: "torch.Tensor | None" = None,
+        segments: list | None = None,
+        dense_paths: "dict[int, np.ndarray] | None" = None,
     ) -> list:
         """Build FullBodyConstraintSet(s) from ExternalPoseConstraint entries.
 
         Each entry specifies a single frame + an uploaded NPZ.  The constraints
         are returned as a flat list so they can be appended to ``constraint_lst``
         and applied on top of trajectory or text segments.
+
+        When ``segments`` and ``dense_paths`` are supplied, each pose's
+        ``smooth_root_2d`` is overridden to the dense path's value at the
+        absolute frame (so it matches the per-frame Root2D constraint of the
+        enclosing segment, exactly like the demo's "Make Smooth Path" wiring).
         """
         _ensure_kimodo_imports()
         from kimodo.constraints import FullBodyConstraintSet
@@ -1152,6 +1495,29 @@ class KimodoService:
 
             smooth_root_2d = posed_joints[:, self.skeleton.root_idx, [0, 2]]
 
+            abs_frame = pc.frame + frame_offset
+
+            # Dense-path override: look up which segment contains abs_frame and
+            # fetch its dense path's XZ at the segment-local index. Falls back
+            # silently to the FK root XZ above if no match.
+            if segments and dense_paths:
+                for seg_idx, seg in enumerate(segments):
+                    if seg.start_frame <= abs_frame < seg.end_frame:
+                        dp = dense_paths.get(seg_idx)
+                        if dp is not None:
+                            local_f = abs_frame - seg.start_frame
+                            dense_xz = dp[local_f]  # (2,) Y-up
+                            smooth_root_2d = torch.tensor(
+                                [[float(dense_xz[0]), float(dense_xz[1])]],
+                                dtype=torch.float32, device=device,
+                            )
+                            log.info(
+                                "  Pose at abs frame %d: smooth_root_2d "
+                                "overridden from dense path of seg %d",
+                                abs_frame, seg_idx,
+                            )
+                        break
+
             # Translate to origin
             if origin_offset_2d is not None:
                 offset = origin_offset_2d.to(device=device, dtype=torch.float32)
@@ -1159,7 +1525,6 @@ class KimodoService:
                 posed_joints[:, :, 2] -= offset[1]
                 smooth_root_2d = smooth_root_2d - offset.unsqueeze(0)
 
-            abs_frame = pc.frame + frame_offset
             constraint = FullBodyConstraintSet(
                 self.skeleton,
                 frame_indices=torch.tensor([abs_frame], dtype=torch.long, device=device),

@@ -212,6 +212,19 @@ class TimelineSpec(BaseModel):
         True, description="Apply foot-skating cleanup and constraint enforcement"
     )
 
+    # --- dense trajectory smoothing ---
+    dense_path: bool = Field(
+        True,
+        description=(
+            "Trajectory smoothing mode. When True (default), trajectory "
+            "waypoints + Full-Body root anchors are densified across the "
+            "entire segment via linear interp + ADMM smoothing (matches the "
+            "demo's 'Make Smooth Path'), then sliced per chunk — strong "
+            "per-frame path following. When False, waypoints are passed as "
+            "sparse anchors (goal-reaching style; model picks the route)."
+        ),
+    )
+
     # --- heading ---
     first_heading_angle: Optional[float] = Field(
         None, description="Initial body heading in radians. None = auto (0.0 if no history). Used for first generation without history."
