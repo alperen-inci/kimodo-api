@@ -102,9 +102,11 @@ def lzyx_heading_to_model_angle(heading_deg: float) -> float:
     → atan2(0, -1) = π. global_root_heading = [cos(model_angle),
     sin(model_angle)].
 
-    NOTE: the +Y/-Y axis is now calibrated. The left/right SIGN (whether
-    +heading_deg turns toward +X or -X) still needs a perpendicular
-    (90°) bench test to confirm.
+    Fully calibrated against the bench (2026-06-15):
+      0°  → +Y (forward)   [roundtrip walk 5/10 → 10/10]
+      90° → +X (right)     [perpendicular test: +turn delta]
+      180°→ -Y (backward)
+      270°→ -X (left)      [perpendicular test: -turn delta]
     """
     import math
     theta = math.radians(heading_deg)
