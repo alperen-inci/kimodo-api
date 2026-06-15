@@ -752,12 +752,23 @@ class KimodoService:
         abs_offset = seg.start_frame
         frame_indices = []
         root2d_positions = []
+        # abs_frame -> model heading angle (rad), only for waypoints that
+        # carry an explicit heading_deg. Used to additionally constrain the
+        # root facing direction at those frames (e.g. to force a turn). The
+        # heading frames are split into a separate Root2DConstraintSet below
+        # because Root2DConstraintSet applies global_root_heading to ALL of
+        # its frames or none.
+        from .coord import lzyx_heading_to_model_angle
+        heading_by_frame: dict[int, float] = {}
 
         for pt in seg.points:
             abs_frame = abs_offset + pt.frame
             frame_indices.append(abs_frame)
             rx, rz = lzyx_root2d(pt.pos[0], pt.pos[1])
             root2d_positions.append([rx, rz])
+            if getattr(pt, "heading_deg", None) is not None:
+                heading_by_frame[abs_frame] = lzyx_heading_to_model_angle(
+                    pt.heading_deg)
 
         if not frame_indices:
             return []
@@ -798,13 +809,46 @@ class KimodoService:
             log.info("  Trajectory translated to origin by offset=[%.3f, %.3f]",
                       offset[0].item(), offset[1].item())
 
-        constraint = Root2DConstraintSet(
-            self.skeleton,
-            frame_indices=torch.tensor(frame_indices, dtype=torch.long, device=device),
-            smooth_root_2d=root2d_t,
-        )
-        log.info("  Built Root2D constraint: %d waypoints, frames %s", len(frame_indices), frame_indices)
-        return [constraint]
+        # Partition frames into heading-bearing and position-only. A single
+        # Root2DConstraintSet applies global_root_heading to all its frames,
+        # so heading frames go in their own set (still carrying position,
+        # equal to the trajectory's natural value here → no position
+        # tug-of-war). Position-only frames stay in the plain set.
+        headed_rows = [i for i, f in enumerate(frame_indices)
+                       if f in heading_by_frame]
+        plain_rows = [i for i, f in enumerate(frame_indices)
+                      if f not in heading_by_frame]
+
+        constraints = []
+        if plain_rows:
+            plain_frames = torch.tensor([frame_indices[i] for i in plain_rows],
+                                        dtype=torch.long, device=device)
+            constraints.append(Root2DConstraintSet(
+                self.skeleton,
+                frame_indices=plain_frames,
+                smooth_root_2d=root2d_t[plain_rows],
+            ))
+        if headed_rows:
+            headed_frames = torch.tensor([frame_indices[i] for i in headed_rows],
+                                         dtype=torch.long, device=device)
+            angles = torch.tensor([heading_by_frame[frame_indices[i]]
+                                   for i in headed_rows],
+                                  dtype=torch.float32, device=device)
+            grh = torch.stack([torch.cos(angles), torch.sin(angles)], dim=-1)
+            constraints.append(Root2DConstraintSet(
+                self.skeleton,
+                frame_indices=headed_frames,
+                smooth_root_2d=root2d_t[headed_rows],
+                global_root_heading=grh,
+            ))
+            log.info("  Heading-constrained %d frame(s): %s (model angle rad: %s)",
+                     len(headed_rows),
+                     [frame_indices[i] for i in headed_rows],
+                     [round(float(a), 3) for a in angles])
+
+        log.info("  Built Root2D constraint: %d waypoints (%d heading), frames %s",
+                 len(frame_indices), len(headed_rows), frame_indices)
+        return constraints
 
     def _build_dense_root2d_constraint(
         self, seg, dense_path: "np.ndarray", origin_offset_2d=None,

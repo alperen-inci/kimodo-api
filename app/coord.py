@@ -80,3 +80,30 @@ def lzyx_root2d(x_lzyx: float, y_lzyx: float) -> tuple[float, float]:
         (root2d_x, root2d_z) in Kimodo's Y-up XZ plane.
     """
     return -x_lzyx, y_lzyx
+
+
+def lzyx_heading_to_model_angle(heading_deg: float) -> float:
+    """Convert an lzyx facing direction to Kimodo's root heading angle (rad).
+
+    Input ``heading_deg``: 0 = +Y (lzyx forward), positive rotates toward
+    +X (lzyx right, clockwise viewed top-down). The facing unit vector in
+    lzyx is therefore ``(dir_x, dir_y) = (sin θ, cos θ)``.
+
+    Kimodo's ``compute_heading_angle`` (feature_utils.py) returns
+    ``atan2(diff_z, -diff_x)`` on the hip vector in its Y-up frame, which
+    works out (after the lzyx→Y-up X-negation in ``lzyx_root2d``) to:
+
+        model_angle = atan2(dir_x_lzyx, -dir_y_lzyx)
+
+    Sanity: facing +Y (forward) → atan2(0, -1) = π; facing -Y (backward)
+    → atan2(0, 1) = 0. global_root_heading = [cos(model_angle),
+    sin(model_angle)].
+
+    NOTE: sign/offset of this convention is to be confirmed empirically
+    via the bench heading sweep; flip here if the character faces the
+    opposite way.
+    """
+    import math
+    theta = math.radians(heading_deg)
+    dir_x, dir_y = math.sin(theta), math.cos(theta)
+    return math.atan2(dir_x, -dir_y)

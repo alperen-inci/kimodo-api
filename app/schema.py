@@ -33,6 +33,19 @@ class TrajectoryPoint(BaseModel):
     pos: list[float] = Field(
         ..., min_length=3, max_length=3, description="[x, y, z] position"
     )
+    heading_deg: Optional[float] = Field(
+        None,
+        description=(
+            "Optional facing direction at this waypoint, in lzyx degrees: "
+            "0 = +Y (forward), positive rotates toward +X (right, "
+            "clockwise viewed top-down). When set, the root heading is "
+            "constrained at this frame (in addition to position) so the "
+            "character faces this way — e.g. to force a turn instead of "
+            "walking backwards. Position is still required and should be "
+            "the trajectory's natural value at this frame to avoid a "
+            "position tug-of-war."
+        ),
+    )
 
 
 class RefSmplxSpec(BaseModel):
