@@ -90,20 +90,23 @@ def lzyx_heading_to_model_angle(heading_deg: float) -> float:
     lzyx is therefore ``(dir_x, dir_y) = (sin θ, cos θ)``.
 
     Kimodo's ``compute_heading_angle`` (feature_utils.py) returns
-    ``atan2(diff_z, -diff_x)`` on the hip vector in its Y-up frame, which
-    works out (after the lzyx→Y-up X-negation in ``lzyx_root2d``) to:
+    ``atan2(diff_z, -diff_x)`` on the hip vector in its Y-up frame.
+    Empirically (bench heading sweep 2026-06-15), the naive derivation
+    ``atan2(dir_x, -dir_y)`` was 180° inverted — heading_deg=0 produced
+    a backward-facing character (run flipped 10/10 fwd → 0/10). The
+    correct mapping is the 180° rotation:
 
-        model_angle = atan2(dir_x_lzyx, -dir_y_lzyx)
+        model_angle = atan2(-dir_x_lzyx, dir_y_lzyx)
 
-    Sanity: facing +Y (forward) → atan2(0, -1) = π; facing -Y (backward)
-    → atan2(0, 1) = 0. global_root_heading = [cos(model_angle),
+    Sanity: facing +Y (forward) → atan2(0, 1) = 0; facing -Y (backward)
+    → atan2(0, -1) = π. global_root_heading = [cos(model_angle),
     sin(model_angle)].
 
-    NOTE: sign/offset of this convention is to be confirmed empirically
-    via the bench heading sweep; flip here if the character faces the
-    opposite way.
+    NOTE: the +Y/-Y axis is now calibrated. The left/right SIGN (whether
+    +heading_deg turns toward +X or -X) still needs a perpendicular
+    (90°) bench test to confirm.
     """
     import math
     theta = math.radians(heading_deg)
     dir_x, dir_y = math.sin(theta), math.cos(theta)
-    return math.atan2(dir_x, -dir_y)
+    return math.atan2(-dir_x, dir_y)
