@@ -814,10 +814,18 @@ class KimodoService:
         # so heading frames go in their own set (still carrying position,
         # equal to the trajectory's natural value here → no position
         # tug-of-war). Position-only frames stay in the plain set.
-        headed_rows = [i for i, f in enumerate(frame_indices)
-                       if f in heading_by_frame]
-        plain_rows = [i for i, f in enumerate(frame_indices)
-                      if f not in heading_by_frame]
+        #
+        # NOTE: _insert_intermediate_waypoints shifts every original
+        # waypoint by -1 (final_frame = target_frame - 1), so the heading
+        # frame's abs index no longer exact-matches heading_by_frame. Map
+        # each headed input to its NEAREST output row instead.
+        row_angle: dict[int, float] = {}
+        for hf, ang in heading_by_frame.items():
+            best_i = min(range(len(frame_indices)),
+                         key=lambda i: abs(frame_indices[i] - hf))
+            row_angle[best_i] = ang
+        headed_rows = sorted(row_angle)
+        plain_rows = [i for i in range(len(frame_indices)) if i not in row_angle]
 
         constraints = []
         if plain_rows:
@@ -831,8 +839,7 @@ class KimodoService:
         if headed_rows:
             headed_frames = torch.tensor([frame_indices[i] for i in headed_rows],
                                          dtype=torch.long, device=device)
-            angles = torch.tensor([heading_by_frame[frame_indices[i]]
-                                   for i in headed_rows],
+            angles = torch.tensor([row_angle[i] for i in headed_rows],
                                   dtype=torch.float32, device=device)
             grh = torch.stack([torch.cos(angles), torch.sin(angles)], dim=-1)
             constraints.append(Root2DConstraintSet(
