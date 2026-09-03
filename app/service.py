@@ -159,6 +159,7 @@ class KimodoService:
         return_format: str = "npz",
         history_info: dict | None = None,
         first_heading_angle_override: float | None = None,
+        coord_out: str = "lzyx",
     ) -> dict:
         """Run inference and return output dict.
 
@@ -299,7 +300,8 @@ class KimodoService:
         if history_info and history_info.get("betas") is not None:
             override_betas = history_info["betas"]
         npz_bytes = self._export_npz(output, return_format=return_format,
-                                     override_betas=override_betas)
+                                     override_betas=override_betas,
+                                     coord_out=coord_out)
 
         actual_frames = int(output["posed_joints"].shape[-3])
         meta = {
@@ -321,12 +323,20 @@ class KimodoService:
     # NPZ export
     # ------------------------------------------------------------------
     def _export_npz(self, output: dict, return_format: str = "npz",
-                    override_betas: np.ndarray | None = None) -> bytes:
+                    override_betas: np.ndarray | None = None,
+                    coord_out: str = "lzyx") -> bytes:
         """Convert model output to NPZ bytes.
 
         Two formats:
           - 'npz': DART-compatible (poses/trans/betas/gender/mocap_framerate)
           - 'amass_npz': AMASS-style (root_orient/pose_body/pose_hand/...)
+
+        ``coord_out``: "lzyx" keeps today's wire byte-for-byte (z_up export,
+        NO ``coord`` field — downstream loaders key their legacy up-axis fix
+        on its absence). "smplx_yup" skips the z_up transform entirely, which
+        both yields canonical axes AND kills the (M - I) @ pelvis_offset
+        translation bias the z_up packing folds in; the NPZ then carries
+        ``coord='smplx_yup'`` (self-describing, COORDINATE_CONTRACT.md §2).
         """
         from kimodo.exports.smplx import get_amass_parameters
 
@@ -340,7 +350,8 @@ class KimodoService:
             root_positions = root_positions[np.newaxis]
 
         trans, root_orient, pose_body = get_amass_parameters(
-            local_rot_mats, root_positions, self.skeleton, z_up=True
+            local_rot_mats, root_positions, self.skeleton,
+            z_up=(coord_out != "smplx_yup"),
         )
 
         # Squeeze batch dim for single sample
@@ -353,10 +364,12 @@ class KimodoService:
 
         if return_format == "amass_npz":
             return self._pack_amass_npz(trans, root_orient, pose_body, T,
-                                       override_betas=override_betas)
+                                       override_betas=override_betas,
+                                       coord_out=coord_out)
         else:
             return self._pack_dart_npz(trans, root_orient, pose_body, T,
-                                       override_betas=override_betas)
+                                       override_betas=override_betas,
+                                       coord_out=coord_out)
 
     def _pack_dart_npz(
         self,
@@ -365,6 +378,7 @@ class KimodoService:
         pose_body: np.ndarray,
         T: int,
         override_betas: np.ndarray | None = None,
+        coord_out: str = "lzyx",
     ) -> bytes:
         """Pack into DART-compatible NPZ.
 
@@ -416,8 +430,7 @@ class KimodoService:
         n_body_joints = n_body_dims // 3
 
         buf = io.BytesIO()
-        np.savez(
-            buf,
+        fields = dict(
             poses=poses,
             trans=trans.astype(np.float32),
             betas=betas.astype(np.float32),
@@ -425,6 +438,12 @@ class KimodoService:
             mocap_framerate=np.int64(30),
             n_body_joints=np.int64(n_body_joints),
         )
+        # Self-describing frame tag, CANONICAL OUTPUT ONLY: legacy lzyx stays
+        # byte-identical because downstream (UE loader) keys its up-axis fix on
+        # the ABSENCE of `coord` in coord-less legacy files.
+        if coord_out == "smplx_yup":
+            fields["coord"] = "smplx_yup"
+        np.savez(buf, **fields)
         return buf.getvalue()
 
     def _pack_amass_npz(
@@ -434,6 +453,7 @@ class KimodoService:
         pose_body: np.ndarray,
         T: int,
         override_betas: np.ndarray | None = None,
+        coord_out: str = "lzyx",
     ) -> bytes:
         """Pack into AMASS-style NPZ."""
         base = dict(self.amass_converter.output_dict_base)
@@ -448,6 +468,8 @@ class KimodoService:
         base["trans"] = trans.astype(np.float32)
         base["root_orient"] = root_orient.astype(np.float32)
         base["pose_body"] = pose_body.astype(np.float32)
+        if coord_out == "smplx_yup":  # see _pack_dart_npz
+            base["coord"] = "smplx_yup"
 
         buf = io.BytesIO()
         np.savez(buf, **base)

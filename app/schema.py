@@ -198,13 +198,24 @@ class TimelineSpec(BaseModel):
     fps: int = Field(30, description="Frames per second. Must be 30.")
 
     # --- coordinate system ---
-    coord_in: Literal["lzyx"] = Field(
+    coord_in: Literal["lzyx", "smplx_yup"] = Field(
         "lzyx",
-        description="Input coordinate system. lzyx = left-handed, Z-up, Y-forward, X-right.",
+        description=(
+            "Input coordinate system for targets/waypoints and (default) uploaded "
+            "NPZs. lzyx = Z-up, Y-forward (the AMASS-style export frame; note it is "
+            "a proper rotation of canonical SMPL-X, not left-handed). smplx_yup = "
+            "canonical SMPL-X: Y-up, right-handed, metres. Uploaded NPZs that carry "
+            "their own `coord` field override this per file."
+        ),
     )
-    coord_out: Literal["lzyx"] = Field(
+    coord_out: Literal["lzyx", "smplx_yup"] = Field(
         "lzyx",
-        description="Output coordinate system. lzyx = left-handed, Z-up, Y-forward, X-right.",
+        description=(
+            "Output coordinate system. lzyx keeps today's wire format byte-for-byte "
+            "(no `coord` field, pelvis-offset trans packing). smplx_yup emits "
+            "canonical SMPL-X (clean trans = root - pelvis_offset, no packing bias) "
+            "and stamps `coord='smplx_yup'` into the NPZ."
+        ),
     )
 
     # --- generation params ---
