@@ -175,6 +175,7 @@ async def generate_timeline(
                 history_result = service.build_history_constraints(
                     npz_path=staged_files[fname],
                     num_history_frames=spec.history_smplx.num_frames,
+                    coord_in=spec.coord_in,
                 )
                 history_constraints = history_result["constraints"]
                 history_info = {
@@ -240,6 +241,7 @@ async def generate_timeline(
                 pose_anchors=pose_anchors,
                 staged_files=staged_files,
                 enabled=bool(spec.dense_path),
+                coord_in=spec.coord_in,
             )
             if dense_paths:
                 log.info("[%s] Dense-path: %d/%d segment(s) densified",
@@ -272,6 +274,7 @@ async def generate_timeline(
                     origin_offset_2d=origin_offset_2d,
                     segments=spec.segments,
                     dense_paths=dense_paths,
+                    coord_in=spec.coord_in,
                 )
                 constraint_lst.extend(pose_constraints)
                 log.info("[%s] Pose constraints: %d external pose keyframe(s)",

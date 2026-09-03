@@ -479,7 +479,7 @@ class KimodoService:
     # History / continuation
     # ------------------------------------------------------------------
     def build_history_constraints(
-        self, npz_path: str, num_history_frames: int = 5
+        self, npz_path: str, num_history_frames: int = 5, coord_in: str = "lzyx"
     ) -> dict:
         """Build FullBodyConstraintSet from the last N frames of a previous motion NPZ.
 
@@ -510,7 +510,11 @@ class KimodoService:
         data = np.load(npz_path, allow_pickle=True)
         keys = set(data.keys())
 
-        log.info("Loading history NPZ: keys=%s", sorted(keys))
+        # Self-describing frame: the file's own `coord` overrides coord_in.
+        from .coord import npz_coord
+        coord = npz_coord(data, default=coord_in)
+
+        log.info("Loading history NPZ: keys=%s coord=%s", sorted(keys), coord)
 
         # --- Detect format and extract local_rot_mats + root_positions (Y-up) ---
         if "local_rot_mats" in keys and "root_positions" in keys:
@@ -537,14 +541,14 @@ class KimodoService:
                 [root_orient_aa[:, np.newaxis, :], body_reshaped], axis=1
             )  # (T, J, 3)
 
-            # Convert Z-up (lzyx) params back to Y-up FK inputs (shared decode)
-            from .coord import lzyx_params_to_yup_fk_inputs
+            # Coord-aware decode to Y-up FK inputs (shared)
+            from .coord import params_to_yup_fk_inputs
             pelvis_offset = self.skeleton.neutral_joints[self.skeleton.root_idx].cpu().numpy()
-            root_positions, local_rot_mats = lzyx_params_to_yup_fk_inputs(
-                all_aa, trans, pelvis_offset
+            root_positions, local_rot_mats = params_to_yup_fk_inputs(
+                all_aa, trans, pelvis_offset, coord=coord
             )
 
-            log.info("  Format: DART/API (poses+trans, %d body joints, converted Z-up→Y-up)", n_body_joints)
+            log.info("  Format: DART/API (poses+trans, %d body joints, coord=%s)", n_body_joints, coord)
 
         elif "root_orient" in keys and "pose_body" in keys and "trans" in keys:
             # AMASS format — same conversion as DART but fields are separate
@@ -558,13 +562,13 @@ class KimodoService:
                 [root_orient_aa[:, np.newaxis, :], body_reshaped], axis=1
             )
 
-            from .coord import lzyx_params_to_yup_fk_inputs
+            from .coord import params_to_yup_fk_inputs
             pelvis_offset = self.skeleton.neutral_joints[self.skeleton.root_idx].cpu().numpy()
-            root_positions, local_rot_mats = lzyx_params_to_yup_fk_inputs(
-                all_aa, trans, pelvis_offset
+            root_positions, local_rot_mats = params_to_yup_fk_inputs(
+                all_aa, trans, pelvis_offset, coord=coord
             )
 
-            log.info("  Format: AMASS (root_orient+pose_body+trans, %d body joints)", n_body_joints)
+            log.info("  Format: AMASS (root_orient+pose_body+trans, %d body joints, coord=%s)", n_body_joints, coord)
 
         else:
             raise ValueError(
@@ -692,7 +696,12 @@ class KimodoService:
         from kimodo.constraints import FullBodyConstraintSet, Root2DConstraintSet
         from kimodo.skeleton import fk
 
-        from .coord import lzyx_root2d
+        from .coord import root2d_from_pos
+
+        # Spec-level positions/headings arrive in coord_in (uploaded NPZs
+        # override per file via their own `coord`).
+        def root2d_pos_fn(pos):
+            return root2d_from_pos(pos, coord=coord_in)
 
         staged_files = staged_files or {}
         dense_paths = dense_paths or {}
@@ -702,8 +711,8 @@ class KimodoService:
             dense_path = dense_paths.get(i)
             if seg.type.value == "trajectory":
                 constraints.extend(self._build_trajectory_constraint(
-                    seg, lzyx_root2d, origin_offset_2d, pose_anchors=pose_anchors,
-                    dense_path=dense_path))
+                    seg, root2d_pos_fn, origin_offset_2d, pose_anchors=pose_anchors,
+                    dense_path=dense_path, coord_in=coord_in))
 
             elif seg.type.value == "text":
                 if dense_path is not None:
@@ -719,7 +728,7 @@ class KimodoService:
                 constraints.extend(
                     self._build_inbetween_constraint(
                         seg, staged_files, origin_offset_2d,
-                        dense_path=dense_path,
+                        dense_path=dense_path, coord_in=coord_in,
                     )
                 )
                 if dense_path is not None:
@@ -731,9 +740,10 @@ class KimodoService:
 
         return constraints
 
-    def _build_trajectory_constraint(self, seg, lzyx_root2d, origin_offset_2d=None,
+    def _build_trajectory_constraint(self, seg, root2d_pos_fn, origin_offset_2d=None,
                                      pose_anchors: list | None = None,
-                                     dense_path: "np.ndarray | None" = None) -> list:
+                                     dense_path: "np.ndarray | None" = None,
+                                     coord_in: str = "lzyx") -> list:
         from kimodo.constraints import Root2DConstraintSet
 
         # Dense mode: one Root2DConstraintSet covering every frame of the
@@ -751,17 +761,17 @@ class KimodoService:
         # heading frames are split into a separate Root2DConstraintSet below
         # because Root2DConstraintSet applies global_root_heading to ALL of
         # its frames or none.
-        from .coord import lzyx_heading_to_model_angle
+        from .coord import heading_to_model_angle
         heading_by_frame: dict[int, float] = {}
 
         for pt in seg.points:
             abs_frame = abs_offset + pt.frame
             frame_indices.append(abs_frame)
-            rx, rz = lzyx_root2d(pt.pos[0], pt.pos[1])
+            rx, rz = root2d_pos_fn(pt.pos)
             root2d_positions.append([rx, rz])
             if getattr(pt, "heading_deg", None) is not None:
-                heading_by_frame[abs_frame] = lzyx_heading_to_model_angle(
-                    pt.heading_deg)
+                heading_by_frame[abs_frame] = heading_to_model_angle(
+                    pt.heading_deg, coord=coord_in)
 
         if not frame_indices:
             return []
@@ -1133,7 +1143,7 @@ class KimodoService:
         return dense
 
     def _extract_inbetween_anchors(
-        self, seg, staged_files: dict
+        self, seg, staged_files: dict, coord_in: str = "lzyx"
     ) -> "list[tuple[int, float, float]]":
         """Pull Full-Body root XZ (Y-up Kimodo) at this inbetween's destination
         frames from the referenced NPZ — lightweight, no FK.
@@ -1143,10 +1153,10 @@ class KimodoService:
         each constrained frame.
 
         For standard SMPL-X/SOMA/G1 skeletons the pelvis neutral has zero XZ
-        offset, so ``lzyx_root2d(trans[i,0], trans[i,1])`` equals
+        offset, so ``root2d_from_pos(trans[i], coord)`` equals
         ``posed_joints[i, root_idx, [0, 2]]`` to numerical precision.
         """
-        from .coord import lzyx_root2d
+        from .coord import npz_coord, root2d_from_pos
 
         ref_spec = seg.ref_smplx
         if ref_spec is None or ref_spec.file_name not in staged_files:
@@ -1155,6 +1165,7 @@ class KimodoService:
             ref_data = np.load(staged_files[ref_spec.file_name], allow_pickle=True)
             ref_trans = ref_data["trans"]
             ref_T = ref_trans.shape[0]
+            ref_coord = npz_coord(ref_data, default=coord_in)
         except Exception as e:
             log.warning("  Could not read inbetween ref '%s' for dense-path anchors: %s",
                         ref_spec.file_name, e)
@@ -1186,7 +1197,7 @@ class KimodoService:
                 continue
             if df < 0 or df >= n_frames:
                 continue
-            rx, rz = lzyx_root2d(float(ref_trans[sf, 0]), float(ref_trans[sf, 1]))
+            rx, rz = root2d_from_pos(ref_trans[sf], coord=ref_coord)
             anchors.append((int(df), rx, rz))
         return anchors
 
@@ -1196,6 +1207,7 @@ class KimodoService:
         pose_anchors: "list[tuple[int, float, float]]",
         staged_files: dict,
         enabled: bool = True,
+        coord_in: str = "lzyx",
     ) -> "dict[int, np.ndarray]":
         """Compute one dense per-frame XZ trajectory per segment that has
         enough anchors.
@@ -1218,7 +1230,7 @@ class KimodoService:
         if not enabled:
             return {}
 
-        from .coord import lzyx_root2d
+        from .coord import root2d_from_pos
 
         dense_paths: dict[int, np.ndarray] = {}
         for i, seg in enumerate(segments):
@@ -1231,13 +1243,13 @@ class KimodoService:
             if seg.type.value == "trajectory" and seg.points:
                 for pt in seg.points:
                     if 0 <= pt.frame < seg_len:
-                        rx, rz = lzyx_root2d(float(pt.pos[0]), float(pt.pos[1]))
+                        rx, rz = root2d_from_pos(pt.pos, coord=coord_in)
                         traj_by_local[int(pt.frame)] = [rx, rz]
 
             # Step 2: Full-Body root anchors from inbetween reference NPZ
             fb_by_local: dict[int, list[float]] = {}
             if seg.type.value == "inbetween":
-                for local_f, x, z in self._extract_inbetween_anchors(seg, staged_files):
+                for local_f, x, z in self._extract_inbetween_anchors(seg, staged_files, coord_in=coord_in):
                     fb_by_local[int(local_f)] = [x, z]
 
             # Step 3: external pose anchors that fall inside this segment
@@ -1282,6 +1294,7 @@ class KimodoService:
         return dense_paths
 
     def _build_inbetween_constraint(self, seg, staged_files: dict, origin_offset_2d=None,
+                                    coord_in: str = "lzyx",
                                     dense_path: "np.ndarray | None" = None) -> list:
         """Build FullBodyConstraintSet from an inbetween segment.
 
@@ -1298,11 +1311,13 @@ class KimodoService:
         if ref_spec.file_name not in staged_files:
             raise ValueError(f"ref_smplx references '{ref_spec.file_name}' but it was not uploaded")
 
-        # Load reference NPZ (DART format: poses, trans)
+        # Load reference NPZ (DART format: poses, trans); frame per file
+        from .coord import npz_coord
         ref_data = np.load(staged_files[ref_spec.file_name], allow_pickle=True)
         ref_poses = ref_data["poses"]    # (T, 165)
         ref_trans = ref_data["trans"]    # (T, 3)
         ref_T = ref_poses.shape[0]
+        ref_coord = npz_coord(ref_data, default=coord_in)
         src_start = ref_spec.smplx_src_start_frame
 
         log.info("  Inbetween ref NPZ: %d frames, src_start=%d", ref_T, src_start)
@@ -1355,11 +1370,11 @@ class KimodoService:
             [kf_root_aa[:, np.newaxis, :], kf_body_aa], axis=1
         )  # (K, J, 3)
 
-        # Convert Z-up (lzyx) params to Y-up FK inputs (shared decode)
-        from .coord import lzyx_params_to_yup_fk_inputs
+        # Coord-aware decode to Y-up FK inputs (shared)
+        from .coord import params_to_yup_fk_inputs
         pelvis_offset = self.skeleton.neutral_joints[self.skeleton.root_idx].cpu().numpy()
-        root_positions, local_rot_mats = lzyx_params_to_yup_fk_inputs(
-            kf_all_aa, kf_trans, pelvis_offset
+        root_positions, local_rot_mats = params_to_yup_fk_inputs(
+            kf_all_aa, kf_trans, pelvis_offset, coord=ref_coord
         )
 
         # FK to get global positions and rotations
@@ -1423,22 +1438,21 @@ class KimodoService:
         Returns list of ``(abs_frame, x_yup, z_yup)`` tuples that can be used
         as additional anchors for trajectory waypoint interpolation.
         """
-        from .coord import lzyx_root2d
+        from .coord import npz_coord, root2d_from_pos
 
         results = []
         for pc in pose_constraints:
             if pc.file_name not in staged_files:
                 continue
             ref_data = np.load(staged_files[pc.file_name], allow_pickle=True)
-            ref_trans = ref_data["trans"]  # (T, 3) in Z-up lzyx
+            ref_trans = ref_data["trans"]  # (T, 3) in the file's own frame
             src_frame = pc.smplx_src_frame
             if src_frame >= ref_trans.shape[0]:
                 continue
 
-            # Get root position and convert lzyx → Y-up 2D
-            pos_zup = ref_trans[src_frame]  # [x, y, z] in lzyx (Z-up)
-            # lzyx_root2d extracts 2D root from lzyx coords
-            rx, rz = lzyx_root2d(pos_zup[0], pos_zup[1])
+            # Root 2D in Kimodo Y-up, per the file's own declared frame
+            ref_coord = npz_coord(ref_data, default=coord_in)
+            rx, rz = root2d_from_pos(ref_trans[src_frame], coord=ref_coord)
             abs_frame = pc.frame + frame_offset
             results.append((abs_frame, rx, rz))
 
@@ -1452,6 +1466,7 @@ class KimodoService:
         origin_offset_2d: "torch.Tensor | None" = None,
         segments: list | None = None,
         dense_paths: "dict[int, np.ndarray] | None" = None,
+        coord_in: str = "lzyx",
     ) -> list:
         """Build FullBodyConstraintSet(s) from ExternalPoseConstraint entries.
 
@@ -1475,9 +1490,11 @@ class KimodoService:
                     f"pose_constraint references '{pc.file_name}' but it was not uploaded"
                 )
 
+            from .coord import npz_coord
             ref_data = np.load(staged_files[pc.file_name], allow_pickle=True)
             ref_poses = ref_data["poses"]   # (T, 165)
             ref_trans = ref_data["trans"]    # (T, 3)
+            ref_coord = npz_coord(ref_data, default=coord_in)
 
             src_frame = pc.smplx_src_frame
             if src_frame >= ref_poses.shape[0]:
@@ -1497,11 +1514,11 @@ class KimodoService:
             kf_body_aa = kf_poses[:, 3:3 + n_body_joints * 3].reshape(1, n_body_joints, 3)
             kf_all_aa = np.concatenate([kf_root_aa[:, np.newaxis, :], kf_body_aa], axis=1)
 
-            # Z-up → Y-up FK inputs (shared decode)
-            from .coord import lzyx_params_to_yup_fk_inputs
+            # Coord-aware decode to Y-up FK inputs (shared)
+            from .coord import params_to_yup_fk_inputs
             pelvis_offset = self.skeleton.neutral_joints[self.skeleton.root_idx].cpu().numpy()
-            root_positions, local_rot_mats = lzyx_params_to_yup_fk_inputs(
-                kf_all_aa, kf_trans, pelvis_offset
+            root_positions, local_rot_mats = params_to_yup_fk_inputs(
+                kf_all_aa, kf_trans, pelvis_offset, coord=ref_coord
             )
 
             device = self.skeleton.device if hasattr(self.skeleton, "device") else "cpu"

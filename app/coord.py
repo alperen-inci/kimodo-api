@@ -153,3 +153,95 @@ def lzyx_params_to_yup_fk_inputs(
         [root_rots_yup[:, np.newaxis, :, :], body_rots], axis=1
     ).astype(np.float32)
     return root_positions, local_rot_mats
+
+
+# ---------------------------------------------------------------------------
+# Self-describing input handling (canonical-axis migration, Phase 2.4)
+# ---------------------------------------------------------------------------
+
+# Wire spellings accepted per frame. "kimodo_zup" is the UE SDK's name for the
+# exact frame this service exports as lzyx (its NPZ writer stamps it on every
+# history/pose file it uploads).
+_COORD_ALIASES = {
+    "lzyx": "lzyx",
+    "kimodo_zup": "lzyx",
+    "smplx_yup": "smplx_yup",
+}
+
+
+def normalize_coord(value: str) -> str:
+    """Canonical spelling of a coord tag ('lzyx' or 'smplx_yup'); raises on unknown."""
+    key = str(value).strip().lower()
+    if key not in _COORD_ALIASES:
+        raise ValueError(
+            f"unknown coord {value!r}; known: {sorted(set(_COORD_ALIASES))}"
+        )
+    return _COORD_ALIASES[key]
+
+
+def npz_coord(data, default: str = "lzyx") -> str:
+    """The frame an uploaded NPZ declares for itself, else ``default``.
+
+    Files are SELF-DESCRIBING (COORDINATE_CONTRACT.md §2): a `coord` field in
+    the file OVERRIDES any request-level coord_in, so a canonical file can
+    never be mis-read as lzyx by a stale caller (or vice versa).
+    """
+    keys = set(getattr(data, "files", None) or data.keys())
+    if "coord" in keys:
+        return normalize_coord(np.asarray(data["coord"]).item())
+    return normalize_coord(default)
+
+
+def params_to_yup_fk_inputs(
+    all_aa: np.ndarray, trans: np.ndarray, pelvis_offset: np.ndarray,
+    coord: str = "lzyx",
+) -> tuple[np.ndarray, np.ndarray]:
+    """Coord-aware ingest decode: SMPL-X-style params -> Kimodo FK inputs.
+
+    "lzyx" is the packed export frame (see lzyx_params_to_yup_fk_inputs).
+    "smplx_yup" is canonical SMPL-X: axes already match Kimodo's Y-up and the
+    translation is the clean AMASS parameter (root - pelvis_offset), so the
+    decode is just the offset add + axis-angle -> matrices.
+    """
+    if normalize_coord(coord) == "lzyx":
+        return lzyx_params_to_yup_fk_inputs(all_aa, trans, pelvis_offset)
+
+    import torch
+    from kimodo.geometry import axis_angle_to_matrix
+
+    root_positions = (trans + pelvis_offset).astype(np.float32)
+    local_rot_mats = (
+        axis_angle_to_matrix(torch.tensor(all_aa, dtype=torch.float32))
+        .numpy()
+        .astype(np.float32)
+    )
+    return root_positions, local_rot_mats
+
+
+def root2d_from_pos(pos, coord: str = "lzyx") -> tuple[float, float]:
+    """Ground-plane root2d [x, z] (Kimodo Y-up) from a wire position.
+
+    lzyx ground plane is XY -> lzyx_root2d; canonical ground plane is XZ and
+    the axes already match Kimodo's, so it reads straight off. Both share the
+    same deliberate approximation as the existing lzyx path: the ~1 cm
+    pelvis-offset XZ term is ignored.
+    """
+    if normalize_coord(coord) == "lzyx":
+        return lzyx_root2d(float(pos[0]), float(pos[1]))
+    return float(pos[0]), float(pos[2])
+
+
+def heading_to_model_angle(heading_deg: float, coord: str = "lzyx") -> float:
+    """Coord-aware facing-direction -> model heading angle (rad).
+
+    The canonical (smplx_yup) zero-direction is CALIBRATED, not derived on
+    paper (the lzyx map needed two bench fixes — see
+    lzyx_heading_to_model_angle); until the Phase 2.5 bench sweep runs,
+    canonical requests must not silently guess.
+    """
+    if normalize_coord(coord) == "lzyx":
+        return lzyx_heading_to_model_angle(heading_deg)
+    raise NotImplementedError(
+        "heading for coord_in='smplx_yup' is not calibrated yet "
+        "(canonical-axis migration Phase 2.5: 0/90/180/270 bench sweep)"
+    )
