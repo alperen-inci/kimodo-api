@@ -303,7 +303,11 @@ class KimodoService:
                                      override_betas=override_betas,
                                      coord_out=coord_out)
 
-        actual_frames = int(output["posed_joints"].shape[-3])
+        # Count frames on an array the export actually packs: root_positions
+        # carries the prepended history frame, posed_joints does NOT — counting
+        # the latter made X-Kimodo-Meta total_frames off by one whenever
+        # history was used.
+        actual_frames = int(output["root_positions"].shape[-2])
         meta = {
             "texts": texts,
             "num_frames": [nf - num_over if i == 0 else nf for i, nf in enumerate(num_frames)],
@@ -657,9 +661,21 @@ class KimodoService:
         # (they get populated during generate() trimming step)
 
         # --- Preserve history betas so export uses the same body shape ---
+        # Normalized to the export's 16-slot layout: uploads have carried 10-
+        # and 300-coefficient betas historically, and echoing an odd length
+        # produced NPZs whose betas field disagreed with our own exports.
         history_betas = None
         if "betas" in keys:
             history_betas = np.array(data["betas"], dtype=np.float32).flatten()
+            if history_betas.shape[0] != 16:
+                log.warning(
+                    "  History betas length %d != 16 — normalizing (pad/truncate)",
+                    history_betas.shape[0],
+                )
+                fixed = np.zeros(16, dtype=np.float32)
+                n = min(16, history_betas.shape[0])
+                fixed[:n] = history_betas[:n]
+                history_betas = fixed
             log.info("  History betas: %s (shape=%s)", history_betas[:6], history_betas.shape)
 
         return {
