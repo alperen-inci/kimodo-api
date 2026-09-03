@@ -2,13 +2,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """Coordinate system conversions between Z-up (lzyx) and Kimodo Y-up.
 
-Kimodo generates in Y-up (right-handed):
-    Right   = +X
+Kimodo generates in canonical SMPL-X Y-up (right-handed; note SMPL-X's +X is
+the SUBJECT'S LEFT — the old "Right = +X" note here was wrong):
+    Left    = +X
     Up      = +Y
     Forward = +Z
 
-DART / AMASS / Blender convention (lzyx, left-handed, Z-up):
-    Right   = +X
+DART / AMASS export convention ("lzyx", Z-up). Despite the historical 'l' in
+the name it is NOT left-handed: M below is a proper rotation (det = +1), so
+the frame stays right-handed — the X negation flips which side +X points to:
+    Right   = +X   (subject's right, because M negates X)
     Forward = +Y
     Up      = +Z
 

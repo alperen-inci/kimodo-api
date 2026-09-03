@@ -15,10 +15,15 @@ Blender and Unreal Engine SMPL-X workflows.
 
 ## Coordinate System
 
-All positions use the **lzyx** coordinate system (same as DART API):
+Positions default to the **lzyx** coordinate system (same as DART API);
+`coord_in`/`coord_out` also accept `smplx_yup` (canonical SMPL-X: Y-up,
+right-handed, metres — output then carries a self-describing `coord` field
+and a clean `trans`). Uploaded NPZs may declare their own frame via a
+`coord` field, which overrides `coord_in` per file.
 
 ```
-lzyx (left-handed, Z-up):
+lzyx (Z-up; a proper rotation of canonical SMPL-X — right-handed despite
+the historical "l" in the name):
     X = right       (+X points right)
     Y = forward     (+Y points forward)
     Z = up          (+Z points up)
