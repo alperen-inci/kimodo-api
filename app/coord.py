@@ -112,3 +112,44 @@ def lzyx_heading_to_model_angle(heading_deg: float) -> float:
     theta = math.radians(heading_deg)
     dir_x, dir_y = math.sin(theta), math.cos(theta)
     return math.atan2(-dir_x, dir_y)
+
+
+def lzyx_params_to_yup_fk_inputs(
+    all_aa: np.ndarray, trans: np.ndarray, pelvis_offset: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Shared lzyx ingest decode: SMPL-X-style params -> Kimodo FK inputs.
+
+    THE single implementation of the Z-up -> Y-up ingest conversion. It was
+    copy-pasted in four places in service.py (history load x2 formats,
+    inbetween keyframes, single-keyframe constraint) before 2026-09; keep it
+    here only.
+
+    Args:
+        all_aa: (T, J, 3) local axis-angle, joint 0 = root orient, in lzyx.
+        trans: (T, 3) lzyx translation as exported by get_amass_parameters
+            z_up=True (pelvis-offset frame: the offset is folded in before the
+            rotation and removed after — see kimodo.exports.smplx).
+        pelvis_offset: (3,) the skeleton's neutral root joint position (Y-up).
+
+    Returns:
+        (root_positions (T, 3) float32 Y-up, local_rot_mats (T, J, 3, 3)
+        float32 Y-up) — ready for kimodo.skeleton.fk.
+    """
+    import torch
+    from kimodo.geometry import axis_angle_to_matrix
+
+    trans_yup = np.matmul(trans + pelvis_offset, M_INV.T) - pelvis_offset
+    root_positions = (trans_yup + pelvis_offset).astype(np.float32)
+
+    root_rots_mat = axis_angle_to_matrix(
+        torch.tensor(all_aa[:, 0], dtype=torch.float32)
+    ).numpy()
+    root_rots_yup = np.matmul(M_INV.T, root_rots_mat)  # undo M @ R
+
+    body_rots = axis_angle_to_matrix(
+        torch.tensor(all_aa[:, 1:], dtype=torch.float32)
+    ).numpy()
+    local_rot_mats = np.concatenate(
+        [root_rots_yup[:, np.newaxis, :, :], body_rots], axis=1
+    ).astype(np.float32)
+    return root_positions, local_rot_mats

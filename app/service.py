@@ -483,7 +483,6 @@ class KimodoService:
         """
         _ensure_kimodo_imports()
         from kimodo.constraints import FullBodyConstraintSet
-        from kimodo.geometry import axis_angle_to_matrix
         from kimodo.skeleton import fk
 
         data = np.load(npz_path, allow_pickle=True)
@@ -516,27 +515,11 @@ class KimodoService:
                 [root_orient_aa[:, np.newaxis, :], body_reshaped], axis=1
             )  # (T, J, 3)
 
-            # Convert Z-up (lzyx) trans back to Y-up for FK
-            # Inverse of get_amass_parameters z_up transform
-            from .coord import M_INV
+            # Convert Z-up (lzyx) params back to Y-up FK inputs (shared decode)
+            from .coord import lzyx_params_to_yup_fk_inputs
             pelvis_offset = self.skeleton.neutral_joints[self.skeleton.root_idx].cpu().numpy()
-            trans_yup = np.matmul(trans + pelvis_offset, M_INV.T) - pelvis_offset
-            root_positions = (trans_yup + pelvis_offset).astype(np.float32)
-
-            # Undo the root orient Z-up rotation
-            root_rots_aa = all_aa[:, 0]  # (T, 3)
-            root_rots_mat = axis_angle_to_matrix(
-                torch.tensor(root_rots_aa, dtype=torch.float32)
-            ).numpy()  # (T, 3, 3)
-            M_inv_t = torch.tensor(M_INV, dtype=torch.float32)
-            root_rots_yup = np.matmul(M_INV.T, root_rots_mat)  # undo M @ R
-
-            # Build local_rot_mats: (T, J, 3, 3)
-            body_rots = axis_angle_to_matrix(
-                torch.tensor(all_aa[:, 1:], dtype=torch.float32)
-            ).numpy()
-            local_rot_mats = np.concatenate(
-                [root_rots_yup[:, np.newaxis, :, :], body_rots], axis=1
+            root_positions, local_rot_mats = lzyx_params_to_yup_fk_inputs(
+                all_aa, trans, pelvis_offset
             )
 
             log.info("  Format: DART/API (poses+trans, %d body joints, converted Z-up→Y-up)", n_body_joints)
@@ -553,21 +536,10 @@ class KimodoService:
                 [root_orient_aa[:, np.newaxis, :], body_reshaped], axis=1
             )
 
-            from .coord import M_INV
+            from .coord import lzyx_params_to_yup_fk_inputs
             pelvis_offset = self.skeleton.neutral_joints[self.skeleton.root_idx].cpu().numpy()
-            trans_yup = np.matmul(trans + pelvis_offset, M_INV.T) - pelvis_offset
-            root_positions = (trans_yup + pelvis_offset).astype(np.float32)
-
-            root_rots_mat = axis_angle_to_matrix(
-                torch.tensor(all_aa[:, 0], dtype=torch.float32)
-            ).numpy()
-            root_rots_yup = np.matmul(M_INV.T, root_rots_mat)
-
-            body_rots = axis_angle_to_matrix(
-                torch.tensor(all_aa[:, 1:], dtype=torch.float32)
-            ).numpy()
-            local_rot_mats = np.concatenate(
-                [root_rots_yup[:, np.newaxis, :, :], body_rots], axis=1
+            root_positions, local_rot_mats = lzyx_params_to_yup_fk_inputs(
+                all_aa, trans, pelvis_offset
             )
 
             log.info("  Format: AMASS (root_orient+pose_body+trans, %d body joints)", n_body_joints)
@@ -696,7 +668,6 @@ class KimodoService:
         """
         _ensure_kimodo_imports()
         from kimodo.constraints import FullBodyConstraintSet, Root2DConstraintSet
-        from kimodo.geometry import axis_angle_to_matrix
         from kimodo.skeleton import fk
 
         from .coord import lzyx_root2d
@@ -1299,10 +1270,7 @@ class KimodoService:
           keyframes_src_frames: [int, ...]   (source frames in ref NPZ)
         """
         from kimodo.constraints import FullBodyConstraintSet
-        from kimodo.geometry import axis_angle_to_matrix
         from kimodo.skeleton import fk
-
-        from .coord import M_INV
 
         ref_spec = seg.ref_smplx
         if ref_spec.file_name not in staged_files:
@@ -1365,25 +1333,12 @@ class KimodoService:
             [kf_root_aa[:, np.newaxis, :], kf_body_aa], axis=1
         )  # (K, J, 3)
 
-        # Convert Z-up (lzyx) to Y-up for Kimodo FK
+        # Convert Z-up (lzyx) params to Y-up FK inputs (shared decode)
+        from .coord import lzyx_params_to_yup_fk_inputs
         pelvis_offset = self.skeleton.neutral_joints[self.skeleton.root_idx].cpu().numpy()
-        trans_yup = np.matmul(kf_trans + pelvis_offset, M_INV.T) - pelvis_offset
-        root_positions = (trans_yup + pelvis_offset).astype(np.float32)
-
-        # Undo Z-up rotation on root orient
-        root_rots_mat = axis_angle_to_matrix(
-            torch.tensor(kf_all_aa[:, 0], dtype=torch.float32)
-        ).numpy()
-        root_rots_yup = np.matmul(M_INV.T, root_rots_mat)
-
-        # Body local rotations (no coord conversion needed)
-        body_rots = axis_angle_to_matrix(
-            torch.tensor(kf_all_aa[:, 1:], dtype=torch.float32)
-        ).numpy()
-
-        local_rot_mats = np.concatenate(
-            [root_rots_yup[:, np.newaxis, :, :], body_rots], axis=1
-        ).astype(np.float32)  # (K, J, 3, 3)
+        root_positions, local_rot_mats = lzyx_params_to_yup_fk_inputs(
+            kf_all_aa, kf_trans, pelvis_offset
+        )
 
         # FK to get global positions and rotations
         device = self.skeleton.device if hasattr(self.skeleton, "device") else "cpu"
@@ -1446,7 +1401,7 @@ class KimodoService:
         Returns list of ``(abs_frame, x_yup, z_yup)`` tuples that can be used
         as additional anchors for trajectory waypoint interpolation.
         """
-        from .coord import M_INV, lzyx_root2d
+        from .coord import lzyx_root2d
 
         results = []
         for pc in pose_constraints:
@@ -1489,10 +1444,7 @@ class KimodoService:
         """
         _ensure_kimodo_imports()
         from kimodo.constraints import FullBodyConstraintSet
-        from kimodo.geometry import axis_angle_to_matrix
         from kimodo.skeleton import fk
-
-        from .coord import M_INV
 
         constraints = []
         for pc in pose_constraints:
@@ -1523,21 +1475,12 @@ class KimodoService:
             kf_body_aa = kf_poses[:, 3:3 + n_body_joints * 3].reshape(1, n_body_joints, 3)
             kf_all_aa = np.concatenate([kf_root_aa[:, np.newaxis, :], kf_body_aa], axis=1)
 
-            # Z-up → Y-up
+            # Z-up → Y-up FK inputs (shared decode)
+            from .coord import lzyx_params_to_yup_fk_inputs
             pelvis_offset = self.skeleton.neutral_joints[self.skeleton.root_idx].cpu().numpy()
-            trans_yup = np.matmul(kf_trans + pelvis_offset, M_INV.T) - pelvis_offset
-            root_positions = (trans_yup + pelvis_offset).astype(np.float32)
-
-            root_rots_mat = axis_angle_to_matrix(
-                torch.tensor(kf_all_aa[:, 0], dtype=torch.float32)
-            ).numpy()
-            root_rots_yup = np.matmul(M_INV.T, root_rots_mat)
-            body_rots = axis_angle_to_matrix(
-                torch.tensor(kf_all_aa[:, 1:], dtype=torch.float32)
-            ).numpy()
-            local_rot_mats = np.concatenate(
-                [root_rots_yup[:, np.newaxis, :, :], body_rots], axis=1
-            ).astype(np.float32)
+            root_positions, local_rot_mats = lzyx_params_to_yup_fk_inputs(
+                kf_all_aa, kf_trans, pelvis_offset
+            )
 
             device = self.skeleton.device if hasattr(self.skeleton, "device") else "cpu"
             local_rots_t = torch.tensor(local_rot_mats, dtype=torch.float32, device=device)
