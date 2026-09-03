@@ -2,13 +2,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """Coordinate system conversions between Z-up (lzyx) and Kimodo Y-up.
 
-Kimodo generates in Y-up (right-handed):
-    Right   = +X
+Kimodo generates in canonical SMPL-X Y-up (right-handed; note SMPL-X's +X is
+the SUBJECT'S LEFT — the old "Right = +X" note here was wrong):
+    Left    = +X
     Up      = +Y
     Forward = +Z
 
-DART / AMASS / Blender convention (lzyx, left-handed, Z-up):
-    Right   = +X
+DART / AMASS export convention ("lzyx", Z-up). Despite the historical 'l' in
+the name it is NOT left-handed: M below is a proper rotation (det = +1), so
+the frame stays right-handed — the X negation flips which side +X points to:
+    Right   = +X   (subject's right, because M negates X)
     Forward = +Y
     Up      = +Z
 
@@ -80,3 +83,175 @@ def lzyx_root2d(x_lzyx: float, y_lzyx: float) -> tuple[float, float]:
         (root2d_x, root2d_z) in Kimodo's Y-up XZ plane.
     """
     return -x_lzyx, y_lzyx
+
+
+def lzyx_heading_to_model_angle(heading_deg: float) -> float:
+    """Convert an lzyx facing direction to Kimodo's root heading angle (rad).
+
+    Input ``heading_deg``: 0 = +Y (lzyx forward), positive rotates toward
+    +X (lzyx right, clockwise viewed top-down). The facing unit vector in
+    lzyx is therefore ``(dir_x, dir_y) = (sin θ, cos θ)``.
+
+    Kimodo's ``compute_heading_angle`` (feature_utils.py) returns
+    ``atan2(diff_z, -diff_x)`` on the hip vector in its Y-up frame.
+    Empirically (bench heading sweep 2026-06-15), the naive derivation
+    ``atan2(dir_x, -dir_y)`` was 180° inverted — heading_deg=0 produced
+    a backward-facing character (run flipped 10/10 fwd → 0/10). The
+    correct mapping is the 180° rotation:
+
+        model_angle = atan2(-dir_x_lzyx, dir_y_lzyx)
+
+    Sanity: facing +Y (forward) → atan2(0, 1) = 0; facing -Y (backward)
+    → atan2(0, -1) = π. global_root_heading = [cos(model_angle),
+    sin(model_angle)].
+
+    Fully calibrated against the bench (2026-06-15):
+      0°  → +Y (forward)   [roundtrip walk 5/10 → 10/10]
+      90° → +X (right)     [perpendicular test: +turn delta]
+      180°→ -Y (backward)
+      270°→ -X (left)      [perpendicular test: -turn delta]
+    """
+    import math
+    theta = math.radians(heading_deg)
+    dir_x, dir_y = math.sin(theta), math.cos(theta)
+    return math.atan2(-dir_x, dir_y)
+
+
+def lzyx_params_to_yup_fk_inputs(
+    all_aa: np.ndarray, trans: np.ndarray, pelvis_offset: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Shared lzyx ingest decode: SMPL-X-style params -> Kimodo FK inputs.
+
+    THE single implementation of the Z-up -> Y-up ingest conversion. It was
+    copy-pasted in four places in service.py (history load x2 formats,
+    inbetween keyframes, single-keyframe constraint) before 2026-09; keep it
+    here only.
+
+    Args:
+        all_aa: (T, J, 3) local axis-angle, joint 0 = root orient, in lzyx.
+        trans: (T, 3) lzyx translation as exported by get_amass_parameters
+            z_up=True (pelvis-offset frame: the offset is folded in before the
+            rotation and removed after — see kimodo.exports.smplx).
+        pelvis_offset: (3,) the skeleton's neutral root joint position (Y-up).
+
+    Returns:
+        (root_positions (T, 3) float32 Y-up, local_rot_mats (T, J, 3, 3)
+        float32 Y-up) — ready for kimodo.skeleton.fk.
+    """
+    import torch
+    from kimodo.geometry import axis_angle_to_matrix
+
+    trans_yup = np.matmul(trans + pelvis_offset, M_INV.T) - pelvis_offset
+    root_positions = (trans_yup + pelvis_offset).astype(np.float32)
+
+    root_rots_mat = axis_angle_to_matrix(
+        torch.tensor(all_aa[:, 0], dtype=torch.float32)
+    ).numpy()
+    root_rots_yup = np.matmul(M_INV.T, root_rots_mat)  # undo M @ R
+
+    body_rots = axis_angle_to_matrix(
+        torch.tensor(all_aa[:, 1:], dtype=torch.float32)
+    ).numpy()
+    local_rot_mats = np.concatenate(
+        [root_rots_yup[:, np.newaxis, :, :], body_rots], axis=1
+    ).astype(np.float32)
+    return root_positions, local_rot_mats
+
+
+# ---------------------------------------------------------------------------
+# Self-describing input handling (canonical-axis migration, Phase 2.4)
+# ---------------------------------------------------------------------------
+
+# Wire spellings accepted per frame. "kimodo_zup" is the UE SDK's name for the
+# exact frame this service exports as lzyx (its NPZ writer stamps it on every
+# history/pose file it uploads).
+_COORD_ALIASES = {
+    "lzyx": "lzyx",
+    "kimodo_zup": "lzyx",
+    "smplx_yup": "smplx_yup",
+}
+
+
+def normalize_coord(value: str) -> str:
+    """Canonical spelling of a coord tag ('lzyx' or 'smplx_yup'); raises on unknown."""
+    key = str(value).strip().lower()
+    if key not in _COORD_ALIASES:
+        raise ValueError(
+            f"unknown coord {value!r}; known: {sorted(set(_COORD_ALIASES))}"
+        )
+    return _COORD_ALIASES[key]
+
+
+def npz_coord(data, default: str = "lzyx") -> str:
+    """The frame an uploaded NPZ declares for itself, else ``default``.
+
+    Files are SELF-DESCRIBING (COORDINATE_CONTRACT.md §2): a `coord` field in
+    the file OVERRIDES any request-level coord_in, so a canonical file can
+    never be mis-read as lzyx by a stale caller (or vice versa).
+    """
+    keys = set(getattr(data, "files", None) or data.keys())
+    if "coord" in keys:
+        return normalize_coord(np.asarray(data["coord"]).item())
+    return normalize_coord(default)
+
+
+def params_to_yup_fk_inputs(
+    all_aa: np.ndarray, trans: np.ndarray, pelvis_offset: np.ndarray,
+    coord: str = "lzyx",
+) -> tuple[np.ndarray, np.ndarray]:
+    """Coord-aware ingest decode: SMPL-X-style params -> Kimodo FK inputs.
+
+    "lzyx" is the packed export frame (see lzyx_params_to_yup_fk_inputs).
+    "smplx_yup" is canonical SMPL-X: axes already match Kimodo's Y-up and the
+    translation is the clean AMASS parameter (root - pelvis_offset), so the
+    decode is just the offset add + axis-angle -> matrices.
+    """
+    if normalize_coord(coord) == "lzyx":
+        return lzyx_params_to_yup_fk_inputs(all_aa, trans, pelvis_offset)
+
+    import torch
+    from kimodo.geometry import axis_angle_to_matrix
+
+    root_positions = (trans + pelvis_offset).astype(np.float32)
+    local_rot_mats = (
+        axis_angle_to_matrix(torch.tensor(all_aa, dtype=torch.float32))
+        .numpy()
+        .astype(np.float32)
+    )
+    return root_positions, local_rot_mats
+
+
+def root2d_from_pos(pos, coord: str = "lzyx") -> tuple[float, float]:
+    """Ground-plane root2d [x, z] (Kimodo Y-up) from a wire position.
+
+    lzyx ground plane is XY -> lzyx_root2d; canonical ground plane is XZ and
+    the axes already match Kimodo's, so it reads straight off. Both share the
+    same deliberate approximation as the existing lzyx path: the ~1 cm
+    pelvis-offset XZ term is ignored.
+    """
+    if normalize_coord(coord) == "lzyx":
+        return lzyx_root2d(float(pos[0]), float(pos[1]))
+    return float(pos[0]), float(pos[2])
+
+
+def heading_to_model_angle(heading_deg: float, coord: str = "lzyx") -> float:
+    """Coord-aware facing-direction -> model heading angle (rad).
+
+    Canonical (smplx_yup) definition — SAME SEMANTICS as lzyx ("0 = forward,
+    90 = the subject's right"), expressed in canonical axes:
+
+        0 = +Z (forward), 90 = -X (subject's right; SMPL-X +X is the LEFT),
+        180 = -Z, 270 = +X.
+
+    Derivation from the calibrated lzyx map through M (and bench-verified by
+    the Phase 2.5 sweep — see tests/calibrate_heading.py): the lzyx facing
+    (sin t, cos t) maps under M_INV to canonical (-sin t, cos t) on the XZ
+    ground plane, and the lzyx model angle atan2(-dir_x_lz, dir_y_lz) becomes
+    atan2(dir_x_cn, dir_z_cn) = atan2(-sin t, cos t) = -t. So:
+
+        model_angle = -radians(heading_deg)
+    """
+    import math
+    if normalize_coord(coord) == "lzyx":
+        return lzyx_heading_to_model_angle(heading_deg)
+    return -math.radians(heading_deg)

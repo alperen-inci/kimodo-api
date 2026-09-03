@@ -33,6 +33,19 @@ class TrajectoryPoint(BaseModel):
     pos: list[float] = Field(
         ..., min_length=3, max_length=3, description="[x, y, z] position"
     )
+    heading_deg: Optional[float] = Field(
+        None,
+        description=(
+            "Optional facing direction at this waypoint, in lzyx degrees: "
+            "0 = +Y (forward), positive rotates toward +X (right, "
+            "clockwise viewed top-down). When set, the root heading is "
+            "constrained at this frame (in addition to position) so the "
+            "character faces this way — e.g. to force a turn instead of "
+            "walking backwards. Position is still required and should be "
+            "the trajectory's natural value at this frame to avoid a "
+            "position tug-of-war."
+        ),
+    )
 
 
 class RefSmplxSpec(BaseModel):
@@ -55,7 +68,7 @@ class SegmentSpec(BaseModel):
 
     # --- common ---
     text: str = Field(
-        ..., min_length=1, description="Motion description for text conditioning"
+        "", description="Motion description for text conditioning. Empty string for constraint-only generation."
     )
 
     # --- trajectory-specific ---
@@ -128,6 +141,25 @@ class SegmentSpec(BaseModel):
         return self
 
 
+class ExternalPoseConstraint(BaseModel):
+    """A full-body pose constraint applied at a specific absolute frame.
+
+    This allows placing pose keyframes *on top of* any segment type
+    (including trajectory segments), so targets and poses can coexist
+    within a single generation span without splitting into separate segments.
+
+    Upload the reference NPZ via multipart ``files`` and reference it here
+    by ``file_name``.
+    """
+
+    frame: int = Field(..., ge=0, description="Absolute frame index in the full timeline")
+    file_name: str = Field(..., description="Uploaded NPZ filename (must match multipart upload)")
+    smplx_src_frame: int = Field(
+        0, ge=0,
+        description="Which frame inside the reference NPZ to use as the constraint pose",
+    )
+
+
 class HistorySpec(BaseModel):
     """History motion for continuation.
 
@@ -153,9 +185,7 @@ class TimelineSpec(BaseModel):
     # --- model ---
     model: str = Field(
         "smplx",
-        description=(
-            "Kimodo model variant. 'smplx' (default) uses Kimodo-SMPLX-RP-v1."
-        ),
+        description="Model variant.",
     )
 
     # --- history / continuation ---
@@ -168,13 +198,24 @@ class TimelineSpec(BaseModel):
     fps: int = Field(30, description="Frames per second. Must be 30.")
 
     # --- coordinate system ---
-    coord_in: Literal["lzyx"] = Field(
+    coord_in: Literal["lzyx", "smplx_yup"] = Field(
         "lzyx",
-        description="Input coordinate system. lzyx = left-handed, Z-up, Y-forward, X-right.",
+        description=(
+            "Input coordinate system for targets/waypoints and (default) uploaded "
+            "NPZs. lzyx = Z-up, Y-forward (the AMASS-style export frame; note it is "
+            "a proper rotation of canonical SMPL-X, not left-handed). smplx_yup = "
+            "canonical SMPL-X: Y-up, right-handed, metres. Uploaded NPZs that carry "
+            "their own `coord` field override this per file."
+        ),
     )
-    coord_out: Literal["lzyx"] = Field(
+    coord_out: Literal["lzyx", "smplx_yup"] = Field(
         "lzyx",
-        description="Output coordinate system. lzyx = left-handed, Z-up, Y-forward, X-right.",
+        description=(
+            "Output coordinate system. lzyx keeps today's wire format byte-for-byte "
+            "(no `coord` field, pelvis-offset trans packing). smplx_yup emits "
+            "canonical SMPL-X (clean trans = root - pelvis_offset, no packing bias) "
+            "and stamps `coord='smplx_yup'` into the NPZ."
+        ),
     )
 
     # --- generation params ---
@@ -195,6 +236,19 @@ class TimelineSpec(BaseModel):
         True, description="Apply foot-skating cleanup and constraint enforcement"
     )
 
+    # --- dense trajectory smoothing ---
+    dense_path: bool = Field(
+        True,
+        description=(
+            "Trajectory smoothing mode. When True (default), trajectory "
+            "waypoints + Full-Body root anchors are densified across the "
+            "entire segment via linear interp + ADMM smoothing (matches the "
+            "demo's 'Make Smooth Path'), then sliced per chunk — strong "
+            "per-frame path following. When False, waypoints are passed as "
+            "sparse anchors (goal-reaching style; model picks the route)."
+        ),
+    )
+
     # --- heading ---
     first_heading_angle: Optional[float] = Field(
         None, description="Initial body heading in radians. None = auto (0.0 if no history). Used for first generation without history."
@@ -203,6 +257,16 @@ class TimelineSpec(BaseModel):
     # --- transition ---
     num_transition_frames: int = Field(
         5, ge=0, le=30, description="Transition blend frames between segments"
+    )
+
+    # --- external pose constraints (overlay on any segment type) ---
+    pose_constraints: Optional[list[ExternalPoseConstraint]] = Field(
+        None,
+        description=(
+            "Full-body pose keyframes applied on top of any segment. "
+            "Allows mixing trajectory waypoints and pose keyframes in a "
+            "single generation span without splitting into separate segments."
+        ),
     )
 
     # --- segments ---
@@ -239,8 +303,6 @@ class TimelineSpec(BaseModel):
 
 class HealthResponse(BaseModel):
     status: str
-    device: str
     model_loaded: bool
-    model_name: Optional[str] = None
-    skeleton: Optional[str] = None
     detail: Optional[str] = None
+    body2hands: Optional[dict] = None

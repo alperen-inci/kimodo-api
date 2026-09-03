@@ -14,6 +14,9 @@ WEIGHTS_DIR="$SCRIPT_DIR/weights"
 
 PORT="${KIMODO_API_PORT:-8020}"
 DEVICE="${KIMODO_DEVICE:-cuda}"
+BODY2HANDS_URL="${KIMODO_BODY2HANDS_URL:-http://host.docker.internal:8021}"
+BODY2HANDS_ENABLED="${KIMODO_BODY2HANDS_ENABLED:-true}"
+BODY2HANDS_TIMEOUT_SEC="${KIMODO_BODY2HANDS_TIMEOUT_SEC:-120}"
 DETACH=""
 
 # Parse args
@@ -40,14 +43,16 @@ fi
 echo "=========================================="
 echo " Kimodo API"
 echo "=========================================="
-echo "  Port:     $PORT"
-echo "  Device:   $DEVICE"
-echo "  Weights:  $WEIGHTS_DIR"
+echo "  Port:       $PORT"
+echo "  Device:     $DEVICE"
+echo "  Weights:    $WEIGHTS_DIR"
+echo "  Body2Hands: $BODY2HANDS_URL (enabled=$BODY2HANDS_ENABLED)"
 echo "=========================================="
 
 docker run --gpus all --rm $DETACH \
     --name kimodo_api \
     -p "${PORT}:8020" \
+    --add-host=host.docker.internal:host-gateway \
     -v "$SCRIPT_DIR/app":/workspace/kimodo-api/app:ro \
     -v "$WEIGHTS_DIR":/workspace/weights:ro \
     -v "${HOME}/.cache/huggingface:/root/.cache/huggingface" \
@@ -57,6 +62,9 @@ docker run --gpus all --rm $DETACH \
     -e KIMODO_DEVICE="$DEVICE" \
     -e KIMODO_API_PORT=8020 \
     -e KIMODO_API_LOG_LEVEL=INFO \
+    -e KIMODO_BODY2HANDS_URL="$BODY2HANDS_URL" \
+    -e KIMODO_BODY2HANDS_ENABLED="$BODY2HANDS_ENABLED" \
+    -e KIMODO_BODY2HANDS_TIMEOUT_SEC="$BODY2HANDS_TIMEOUT_SEC" \
     -e PYTHONPATH=/workspace/kimodo \
     -w /workspace/kimodo-api \
     kimodo:genmo \
