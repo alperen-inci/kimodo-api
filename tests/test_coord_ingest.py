@@ -173,9 +173,16 @@ def test_root2d_dispatch():
     assert root2d_from_pos([1.5, 9.9, 2.5], coord="kimodo_zup") == (-1.5, 9.9)
 
 
-def test_canonical_heading_is_gated_until_calibration():
-    assert heading_to_model_angle(90.0, coord="lzyx") == pytest.approx(
-        __import__("math").atan2(-1.0, 0.0)
-    )
-    with pytest.raises(NotImplementedError):
-        heading_to_model_angle(0.0, coord="smplx_yup")
+def test_canonical_heading_map():
+    import math
+    # lzyx map untouched
+    assert heading_to_model_angle(90.0, coord="lzyx") == pytest.approx(math.atan2(-1.0, 0.0))
+    # canonical: same semantics (0 = forward, 90 = subject's right) in Y-up axes.
+    # model_angle = -radians(theta); consistency with the lzyx map through M:
+    # the same physical facing must give the same model angle in both frames.
+    for deg in (0.0, 90.0, 180.0, 270.0, 37.5):
+        via_lzyx = heading_to_model_angle(deg, coord="lzyx")
+        via_canon = heading_to_model_angle(deg, coord="smplx_yup")
+        # angles equal modulo 2*pi
+        d = (via_lzyx - via_canon) % (2 * math.pi)
+        assert min(d, 2 * math.pi - d) < 1e-9, (deg, via_lzyx, via_canon)

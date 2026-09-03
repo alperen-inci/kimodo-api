@@ -237,14 +237,21 @@ def root2d_from_pos(pos, coord: str = "lzyx") -> tuple[float, float]:
 def heading_to_model_angle(heading_deg: float, coord: str = "lzyx") -> float:
     """Coord-aware facing-direction -> model heading angle (rad).
 
-    The canonical (smplx_yup) zero-direction is CALIBRATED, not derived on
-    paper (the lzyx map needed two bench fixes — see
-    lzyx_heading_to_model_angle); until the Phase 2.5 bench sweep runs,
-    canonical requests must not silently guess.
+    Canonical (smplx_yup) definition — SAME SEMANTICS as lzyx ("0 = forward,
+    90 = the subject's right"), expressed in canonical axes:
+
+        0 = +Z (forward), 90 = -X (subject's right; SMPL-X +X is the LEFT),
+        180 = -Z, 270 = +X.
+
+    Derivation from the calibrated lzyx map through M (and bench-verified by
+    the Phase 2.5 sweep — see tests/calibrate_heading.py): the lzyx facing
+    (sin t, cos t) maps under M_INV to canonical (-sin t, cos t) on the XZ
+    ground plane, and the lzyx model angle atan2(-dir_x_lz, dir_y_lz) becomes
+    atan2(dir_x_cn, dir_z_cn) = atan2(-sin t, cos t) = -t. So:
+
+        model_angle = -radians(heading_deg)
     """
+    import math
     if normalize_coord(coord) == "lzyx":
         return lzyx_heading_to_model_angle(heading_deg)
-    raise NotImplementedError(
-        "heading for coord_in='smplx_yup' is not calibrated yet "
-        "(canonical-axis migration Phase 2.5: 0/90/180/270 bench sweep)"
-    )
+    return -math.radians(heading_deg)
