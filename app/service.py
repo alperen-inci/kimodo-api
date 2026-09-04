@@ -765,8 +765,19 @@ class KimodoService:
         # Dense mode: one Root2DConstraintSet covering every frame of the
         # segment with the pre-computed smoothed path. Skip the per-chunk
         # interp shim entirely — every chunk already has per-frame guidance.
+        #
+        # Heading still has to be honoured here. This used to be a bare early
+        # return, which silently dropped every per-waypoint facing lock the
+        # caller asked for: a Root2DConstraintSet applies global_root_heading
+        # to ALL of its frames or none, so heading always needs its own set,
+        # and the dense set has no heading at all. The headed frames are added
+        # ALONGSIDE the dense set, exactly as the sparse branch below does.
         if dense_path is not None:
-            return self._build_dense_root2d_constraint(seg, dense_path, origin_offset_2d)
+            constraints = self._build_dense_root2d_constraint(
+                seg, dense_path, origin_offset_2d)
+            constraints += self._build_heading_constraints(
+                seg, root2d_pos_fn, coord_in, origin_offset_2d)
+            return constraints
 
         abs_offset = seg.start_frame
         frame_indices = []
@@ -875,6 +886,48 @@ class KimodoService:
         log.info("  Built Root2D constraint: %d waypoints (%d heading), frames %s",
                  len(frame_indices), len(headed_rows), frame_indices)
         return constraints
+
+    def _build_heading_constraints(
+        self, seg, root2d_pos_fn, coord_in, origin_offset_2d=None,
+    ) -> list:
+        """One Root2DConstraintSet per heading-bearing waypoint group.
+
+        Shared by the dense and sparse trajectory paths. Position comes from
+        the waypoint itself, so the heading set never fights the path it sits
+        on. Returns [] when no waypoint carries `heading_deg`.
+        """
+        from kimodo.constraints import Root2DConstraintSet
+        from .coord import heading_to_model_angle
+
+        frames, positions, angles_list = [], [], []
+        for pt in seg.points or []:
+            if getattr(pt, "heading_deg", None) is None:
+                continue
+            rx, rz = root2d_pos_fn(pt.pos)
+            frames.append(seg.start_frame + pt.frame)
+            positions.append([rx, rz])
+            angles_list.append(heading_to_model_angle(pt.heading_deg, coord=coord_in))
+
+        if not frames:
+            return []
+
+        device = self.skeleton.device if hasattr(self.skeleton, "device") else "cpu"
+        pos_t = torch.tensor(positions, dtype=torch.float32, device=device)
+        if origin_offset_2d is not None:
+            pos_t = pos_t - origin_offset_2d.to(
+                device=device, dtype=torch.float32).unsqueeze(0)
+        angles = torch.tensor(angles_list, dtype=torch.float32, device=device)
+        grh = torch.stack([torch.cos(angles), torch.sin(angles)], dim=-1)
+
+        log.info("  Heading-constrained %d frame(s) alongside dense path: %s "
+                 "(model angle rad: %s)",
+                 len(frames), frames, [round(float(a), 3) for a in angles])
+        return [Root2DConstraintSet(
+            self.skeleton,
+            frame_indices=torch.tensor(frames, dtype=torch.long, device=device),
+            smooth_root_2d=pos_t,
+            global_root_heading=grh,
+        )]
 
     def _build_dense_root2d_constraint(
         self, seg, dense_path: "np.ndarray", origin_offset_2d=None,
