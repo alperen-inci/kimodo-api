@@ -3,14 +3,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """Phase 2.5 heading calibration sweep (needs the live service + GPU).
 
-For each coord ('lzyx' control, 'smplx_yup' candidate) and each heading
+For each coord ('lzyx' control, 'rh_yup' candidate) and each heading
 H in {0, 90, 180, 270}: generate a walk toward a 3.5 m target placed in
 direction H, with a waypoint heading_deg=H, then measure the OUTPUT's actual
 ground-plane travel direction and report the error vs H.
 
 Direction conventions under test (same semantics, per-frame axes):
     lzyx:      0 = +Y (forward), 90 = +X (subject's right)
-    smplx_yup: 0 = +Z (forward), 90 = -X (subject's right)
+    rh_yup: 0 = +Z (forward), 90 = -X (subject's right)
 
 Usage:  python3 tests/calibrate_heading.py [http://localhost:8020]
 """
@@ -35,7 +35,7 @@ def gen(spec: dict) -> dict:
         f"{spec_json}\r\n--{boundary}--\r\n"
     ).encode()
     req = urllib.request.Request(
-        f"{BASE}/generate/kimodo", data=payload,
+        f"{BASE}/generate/from_text", data=payload,
         headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
     with urllib.request.urlopen(req, timeout=600) as r:
         return dict(np.load(io.BytesIO(r.read()), allow_pickle=True))
@@ -58,7 +58,7 @@ def travel_deg(coord: str, trans: np.ndarray) -> float:
 def main():
     print(f"service: {BASE}  dist={DIST}m seed={SEED}")
     worst = 0.0
-    for coord in ("lzyx", "smplx_yup"):
+    for coord in ("lzyx", "rh_yup"):
         for H in (0.0, 90.0, 180.0, 270.0):
             dx, dfwd = direction(coord, H)
             pos = [DIST * dx, DIST * dfwd, 0.0] if coord == "lzyx" else [DIST * dx, 0.0, DIST * dfwd]

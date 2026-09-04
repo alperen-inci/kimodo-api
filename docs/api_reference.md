@@ -16,7 +16,7 @@ Blender and Unreal Engine SMPL-X workflows.
 ## Coordinate System
 
 Positions default to the **lzyx** coordinate system (same as DART API);
-`coord_in`/`coord_out` also accept `smplx_yup` (canonical SMPL-X: Y-up,
+`coord_in`/`coord_out` also accept `rh_yup` (canonical SMPL-X: Y-up,
 right-handed, metres — output then carries a self-describing `coord` field
 and a clean `trans`). Uploaded NPZs may declare their own frame via a
 `coord` field, which overrides `coord_in` per file.
@@ -77,7 +77,7 @@ Generate motion from a timeline specification.
 
 **Response Headers:**
 - `Content-Disposition: attachment; filename="kimodo_motion_<id>.npz"`
-- `X-Kimodo-Meta: <JSON metadata about the generation>`
+- `X-Motion-Meta: <JSON metadata about the generation>`
 
 ---
 

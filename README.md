@@ -87,7 +87,7 @@ Compatible with DART API output — same Blender import workflow.
 
 ```
 lzyx (Z-up; right-handed — a proper rotation of canonical SMPL-X, the
-"l" in the name is historical). smplx_yup (canonical) is also accepted
+"l" in the name is historical). rh_yup (canonical) is also accepted
 via coord_in/coord_out:
     X = right
     Y = forward

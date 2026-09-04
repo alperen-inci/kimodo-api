@@ -117,10 +117,10 @@ from app.coord import (  # noqa: E402
 
 def test_npz_coord_reads_the_file_and_falls_back_to_the_request():
     assert npz_coord({"poses": 1, "trans": 2}) == "lzyx"
-    assert npz_coord({"poses": 1}, default="smplx_yup") == "smplx_yup"
+    assert npz_coord({"poses": 1}, default="rh_yup") == "rh_yup"
     # The UE SDK stamps coord='kimodo_zup' on every uploaded NPZ — same frame.
     assert npz_coord({"coord": np.str_("kimodo_zup")}) == "lzyx"
-    assert npz_coord({"coord": np.str_("smplx_yup")}, default="lzyx") == "smplx_yup"
+    assert npz_coord({"coord": np.str_("rh_yup")}, default="lzyx") == "rh_yup"
     with pytest.raises(ValueError):
         npz_coord({"coord": np.str_("ue_xyz")})
     with pytest.raises(ValueError):
@@ -158,7 +158,7 @@ def test_lzyx_and_canonical_inputs_decode_to_the_same_fk_state():
     trans_lz = (trans_canon + pelvis_offset) @ Mf.T - pelvis_offset
 
     pos_a, rots_a = params_to_yup_fk_inputs(aa_lz, trans_lz, pelvis_offset, coord="lzyx")
-    pos_b, rots_b = params_to_yup_fk_inputs(aa_canon, trans_canon, pelvis_offset, coord="smplx_yup")
+    pos_b, rots_b = params_to_yup_fk_inputs(aa_canon, trans_canon, pelvis_offset, coord="rh_yup")
 
     assert np.allclose(pos_a, pos_b, atol=1e-5)
     assert np.allclose(rots_a, rots_b, atol=1e-5)
@@ -169,7 +169,7 @@ def test_lzyx_and_canonical_inputs_decode_to_the_same_fk_state():
 def test_root2d_dispatch():
     # lzyx ground plane XY -> (-x, y); canonical ground plane XZ -> (x, z)
     assert root2d_from_pos([1.5, 2.5, 9.9], coord="lzyx") == (-1.5, 2.5)
-    assert root2d_from_pos([1.5, 9.9, 2.5], coord="smplx_yup") == (1.5, 2.5)
+    assert root2d_from_pos([1.5, 9.9, 2.5], coord="rh_yup") == (1.5, 2.5)
     assert root2d_from_pos([1.5, 9.9, 2.5], coord="kimodo_zup") == (-1.5, 9.9)
 
 
@@ -182,7 +182,7 @@ def test_canonical_heading_map():
     # the same physical facing must give the same model angle in both frames.
     for deg in (0.0, 90.0, 180.0, 270.0, 37.5):
         via_lzyx = heading_to_model_angle(deg, coord="lzyx")
-        via_canon = heading_to_model_angle(deg, coord="smplx_yup")
+        via_canon = heading_to_model_angle(deg, coord="rh_yup")
         # angles equal modulo 2*pi
         d = (via_lzyx - via_canon) % (2 * math.pi)
         assert min(d, 2 * math.pi - d) < 1e-9, (deg, via_lzyx, via_canon)

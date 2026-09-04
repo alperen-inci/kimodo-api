@@ -48,11 +48,11 @@ class TrajectoryPoint(BaseModel):
     )
 
 
-class RefSmplxSpec(BaseModel):
+class RefMotionSpec(BaseModel):
     """Reference SMPL-X NPZ for inbetween constraints."""
 
     file_name: str = Field(..., description="Uploaded NPZ filename (must match multipart upload)")
-    smplx_src_start_frame: int = Field(0, ge=0, description="Start frame in the reference NPZ")
+    source_start_frame: int = Field(0, ge=0, description="Start frame in the reference NPZ")
 
 
 class SegmentSpec(BaseModel):
@@ -84,7 +84,7 @@ class SegmentSpec(BaseModel):
     )
 
     # --- inbetween-specific (same format as DART API) ---
-    ref_smplx: Optional[RefSmplxSpec] = Field(
+    reference_motion: Optional[RefMotionSpec] = Field(
         None, description="Reference SMPL-X NPZ for keyframe constraints"
     )
     mask_mode: Optional[str] = Field(
@@ -95,7 +95,7 @@ class SegmentSpec(BaseModel):
         None, description="Segment-local frame indices to constrain (for mask_mode='keyframes')"
     )
     keyframes_src_frames: Optional[list[int]] = Field(
-        None, description="Corresponding source frame indices in ref_smplx NPZ"
+        None, description="Corresponding source frame indices in reference_motion NPZ"
     )
 
     @model_validator(mode="after")
@@ -126,10 +126,10 @@ class SegmentSpec(BaseModel):
                         f"Point frame {pt.frame} out of range for segment "
                         f"with {n_frames} frames [0, {n_frames})"
                     )
-        # inbetween must have ref_smplx
+        # inbetween must have reference_motion
         if self.type == SegmentType.inbetween:
-            if not self.ref_smplx:
-                raise ValueError("Inbetween segment requires ref_smplx")
+            if not self.reference_motion:
+                raise ValueError("Inbetween segment requires reference_motion")
             if self.mask_mode == "keyframes" and not self.keyframes:
                 raise ValueError("mask_mode='keyframes' requires keyframes list")
             if self.keyframes:
@@ -154,7 +154,7 @@ class ExternalPoseConstraint(BaseModel):
 
     frame: int = Field(..., ge=0, description="Absolute frame index in the full timeline")
     file_name: str = Field(..., description="Uploaded NPZ filename (must match multipart upload)")
-    smplx_src_frame: int = Field(
+    source_frame: int = Field(
         0, ge=0,
         description="Which frame inside the reference NPZ to use as the constraint pose",
     )
@@ -189,7 +189,7 @@ class TimelineSpec(BaseModel):
     )
 
     # --- history / continuation ---
-    history_smplx: Optional[HistorySpec] = Field(
+    history_motion: Optional[HistorySpec] = Field(
         None,
         description="Previous motion NPZ for continuation. Upload the file via multipart 'files' field.",
     )
@@ -198,23 +198,23 @@ class TimelineSpec(BaseModel):
     fps: int = Field(30, description="Frames per second. Must be 30.")
 
     # --- coordinate system ---
-    coord_in: Literal["lzyx", "smplx_yup"] = Field(
+    coord_in: Literal["lzyx", "rh_yup"] = Field(
         "lzyx",
         description=(
             "Input coordinate system for targets/waypoints and (default) uploaded "
             "NPZs. lzyx = Z-up, Y-forward (the AMASS-style export frame; note it is "
-            "a proper rotation of canonical SMPL-X, not left-handed). smplx_yup = "
+            "a proper rotation of canonical SMPL-X, not left-handed). rh_yup = "
             "canonical SMPL-X: Y-up, right-handed, metres. Uploaded NPZs that carry "
             "their own `coord` field override this per file."
         ),
     )
-    coord_out: Literal["lzyx", "smplx_yup"] = Field(
+    coord_out: Literal["lzyx", "rh_yup"] = Field(
         "lzyx",
         description=(
             "Output coordinate system. lzyx keeps today's wire format byte-for-byte "
-            "(no `coord` field, pelvis-offset trans packing). smplx_yup emits "
+            "(no `coord` field, pelvis-offset trans packing). rh_yup emits "
             "canonical SMPL-X (clean trans = root - pelvis_offset, no packing bias) "
-            "and stamps `coord='smplx_yup'` into the NPZ."
+            "and stamps `coord='rh_yup'` into the NPZ."
         ),
     )
 

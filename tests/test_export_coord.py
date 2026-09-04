@@ -9,7 +9,7 @@
    z_up packing removed — applying the packing (M with the pelvis-offset
    frame on trans, M @ R on the root) to the canonical NPZ reproduces the
    lzyx NPZ.
-3. Self-description: the canonical NPZ carries coord='smplx_yup'; lzyx none.
+3. Self-description: the canonical NPZ carries coord='rh_yup'; lzyx none.
 
 No GPU, no model: a mock skeleton drives MotionService._export_npz directly;
 kimodo's pure-math submodules are loaded file-direct (kimodo/__init__ pulls
@@ -129,9 +129,9 @@ def test_canonical_output_is_the_unpacked_lzyx(svc):
     lz = dict(np.load(io.BytesIO(svc._export_npz(
         output, return_format="npz", coord_out="lzyx")), allow_pickle=True))
     cn = dict(np.load(io.BytesIO(svc._export_npz(
-        output, return_format="npz", coord_out="smplx_yup")), allow_pickle=True))
+        output, return_format="npz", coord_out="rh_yup")), allow_pickle=True))
 
-    assert str(cn["coord"]) == "smplx_yup"
+    assert str(cn["coord"]) == "rh_yup"
 
     off = svc.skeleton.neutral_joints[0].numpy()
     # trans: re-apply the z_up packing to the canonical trans -> lzyx trans

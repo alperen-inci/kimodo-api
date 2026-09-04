@@ -168,12 +168,12 @@ def lzyx_params_to_yup_fk_inputs(
 _COORD_ALIASES = {
     "lzyx": "lzyx",
     "kimodo_zup": "lzyx",
-    "smplx_yup": "smplx_yup",
+    "rh_yup": "rh_yup",
 }
 
 
 def normalize_coord(value: str) -> str:
-    """Canonical spelling of a coord tag ('lzyx' or 'smplx_yup'); raises on unknown."""
+    """Canonical spelling of a coord tag ('lzyx' or 'rh_yup'); raises on unknown."""
     key = str(value).strip().lower()
     if key not in _COORD_ALIASES:
         raise ValueError(
@@ -202,7 +202,7 @@ def params_to_yup_fk_inputs(
     """Coord-aware ingest decode: SMPL-X-style params -> Kimodo FK inputs.
 
     "lzyx" is the packed export frame (see lzyx_params_to_yup_fk_inputs).
-    "smplx_yup" is canonical SMPL-X: axes already match Kimodo's Y-up and the
+    "rh_yup" is canonical SMPL-X: axes already match Kimodo's Y-up and the
     translation is the clean AMASS parameter (root - pelvis_offset), so the
     decode is just the offset add + axis-angle -> matrices.
     """
@@ -237,7 +237,7 @@ def root2d_from_pos(pos, coord: str = "lzyx") -> tuple[float, float]:
 def heading_to_model_angle(heading_deg: float, coord: str = "lzyx") -> float:
     """Coord-aware facing-direction -> model heading angle (rad).
 
-    Canonical (smplx_yup) definition — SAME SEMANTICS as lzyx ("0 = forward,
+    Canonical (rh_yup) definition — SAME SEMANTICS as lzyx ("0 = forward,
     90 = the subject's right"), expressed in canonical axes:
 
         0 = +Z (forward), 90 = -X (subject's right; SMPL-X +X is the LEFT),

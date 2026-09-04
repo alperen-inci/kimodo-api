@@ -305,7 +305,7 @@ class KimodoService:
 
         # Count frames on an array the export actually packs: root_positions
         # carries the prepended history frame, posed_joints does NOT — counting
-        # the latter made X-Kimodo-Meta total_frames off by one whenever
+        # the latter made X-Motion-Meta total_frames off by one whenever
         # history was used.
         actual_frames = int(output["root_positions"].shape[-2])
         meta = {
@@ -337,10 +337,10 @@ class KimodoService:
 
         ``coord_out``: "lzyx" keeps today's wire byte-for-byte (z_up export,
         NO ``coord`` field — downstream loaders key their legacy up-axis fix
-        on its absence). "smplx_yup" skips the z_up transform entirely, which
+        on its absence). "rh_yup" skips the z_up transform entirely, which
         both yields canonical axes AND kills the (M - I) @ pelvis_offset
         translation bias the z_up packing folds in; the NPZ then carries
-        ``coord='smplx_yup'`` (self-describing, COORDINATE_CONTRACT.md §2).
+        ``coord='rh_yup'`` (self-describing, COORDINATE_CONTRACT.md §2).
         """
         from kimodo.exports.smplx import get_amass_parameters
 
@@ -355,7 +355,7 @@ class KimodoService:
 
         trans, root_orient, pose_body = get_amass_parameters(
             local_rot_mats, root_positions, self.skeleton,
-            z_up=(coord_out != "smplx_yup"),
+            z_up=(coord_out != "rh_yup"),
         )
 
         # Squeeze batch dim for single sample
@@ -445,8 +445,8 @@ class KimodoService:
         # Self-describing frame tag, CANONICAL OUTPUT ONLY: legacy lzyx stays
         # byte-identical because downstream (UE loader) keys its up-axis fix on
         # the ABSENCE of `coord` in coord-less legacy files.
-        if coord_out == "smplx_yup":
-            fields["coord"] = "smplx_yup"
+        if coord_out == "rh_yup":
+            fields["coord"] = "rh_yup"
         np.savez(buf, **fields)
         return buf.getvalue()
 
@@ -472,8 +472,8 @@ class KimodoService:
         base["trans"] = trans.astype(np.float32)
         base["root_orient"] = root_orient.astype(np.float32)
         base["pose_body"] = pose_body.astype(np.float32)
-        if coord_out == "smplx_yup":  # see _pack_dart_npz
-            base["coord"] = "smplx_yup"
+        if coord_out == "rh_yup":  # see _pack_dart_npz
+            base["coord"] = "rh_yup"
 
         buf = io.BytesIO()
         np.savez(buf, **base)
@@ -1227,7 +1227,7 @@ class KimodoService:
         """
         from .coord import npz_coord, root2d_from_pos
 
-        ref_spec = seg.ref_smplx
+        ref_spec = seg.reference_motion
         if ref_spec is None or ref_spec.file_name not in staged_files:
             return []
         try:
@@ -1241,7 +1241,7 @@ class KimodoService:
             return []
 
         n_frames = seg.end_frame - seg.start_frame
-        src_start = ref_spec.smplx_src_start_frame
+        src_start = ref_spec.source_start_frame
         mask_mode = seg.mask_mode or "endpoints"
 
         if mask_mode == "none":
@@ -1368,7 +1368,7 @@ class KimodoService:
         """Build FullBodyConstraintSet from an inbetween segment.
 
         Accepts the same request format as DART API:
-          ref_smplx: {file_name, smplx_src_start_frame}
+          reference_motion: {file_name, source_start_frame}
           mask_mode: "endpoints" | "keyframes" | "all" | "none"
           keyframes: [int, ...]              (segment-local destination frames)
           keyframes_src_frames: [int, ...]   (source frames in ref NPZ)
@@ -1376,9 +1376,9 @@ class KimodoService:
         from kimodo.constraints import FullBodyConstraintSet
         from kimodo.skeleton import fk
 
-        ref_spec = seg.ref_smplx
+        ref_spec = seg.reference_motion
         if ref_spec.file_name not in staged_files:
-            raise ValueError(f"ref_smplx references '{ref_spec.file_name}' but it was not uploaded")
+            raise ValueError(f"reference_motion references '{ref_spec.file_name}' but it was not uploaded")
 
         # Load reference NPZ (DART format: poses, trans); frame per file
         from .coord import npz_coord
@@ -1387,7 +1387,7 @@ class KimodoService:
         ref_trans = ref_data["trans"]    # (T, 3)
         ref_T = ref_poses.shape[0]
         ref_coord = npz_coord(ref_data, default=coord_in)
-        src_start = ref_spec.smplx_src_start_frame
+        src_start = ref_spec.source_start_frame
 
         log.info("  Inbetween ref NPZ: %d frames, src_start=%d", ref_T, src_start)
 
@@ -1515,7 +1515,7 @@ class KimodoService:
                 continue
             ref_data = np.load(staged_files[pc.file_name], allow_pickle=True)
             ref_trans = ref_data["trans"]  # (T, 3) in the file's own frame
-            src_frame = pc.smplx_src_frame
+            src_frame = pc.source_frame
             if src_frame >= ref_trans.shape[0]:
                 continue
 
@@ -1565,10 +1565,10 @@ class KimodoService:
             ref_trans = ref_data["trans"]    # (T, 3)
             ref_coord = npz_coord(ref_data, default=coord_in)
 
-            src_frame = pc.smplx_src_frame
+            src_frame = pc.source_frame
             if src_frame >= ref_poses.shape[0]:
                 raise ValueError(
-                    f"smplx_src_frame {src_frame} out of range [0, {ref_poses.shape[0]})"
+                    f"source_frame {src_frame} out of range [0, {ref_poses.shape[0]})"
                 )
 
             # Extract single frame

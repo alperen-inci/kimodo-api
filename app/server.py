@@ -4,7 +4,7 @@
 
 Endpoints:
     GET  /health              — Service health and model status
-    POST /generate/kimodo   — Generate motion from a timeline specification
+    POST /generate/from_text   — Generate motion from a timeline specification
 """
 
 from __future__ import annotations
@@ -100,9 +100,9 @@ async def health():
 
 
 # ---------------------------------------------------------------------------
-# /generate/kimodo
+# /generate/from_text
 # ---------------------------------------------------------------------------
-@app.post("/generate/kimodo")
+@app.post("/generate/from_text")
 async def generate_timeline(
     request: Request,
     spec_json: str = Form(..., description="JSON timeline specification"),
@@ -112,12 +112,12 @@ async def generate_timeline(
 
     Accepts a multipart form with:
       - ``spec_json``: JSON string matching ``TimelineSpec``
-      - ``files`` (optional, repeatable): file uploads referenced by ``history_smplx.file_name``
+      - ``files`` (optional, repeatable): file uploads referenced by ``history_motion.file_name``
 
     Returns a raw ``.npz`` file as ``application/octet-stream``.
     """
     req_id = uuid.uuid4().hex[:8]
-    log.info("[%s] /generate/kimodo — received request (%d file(s))", req_id, len(files))
+    log.info("[%s] /generate/from_text — received request (%d file(s))", req_id, len(files))
 
     # ---- Parse spec ----
     try:
@@ -138,7 +138,7 @@ async def generate_timeline(
         spec.diffusion_steps,
         spec.num_samples,
         spec.return_format,
-        spec.history_smplx.file_name if spec.history_smplx else "none",
+        spec.history_motion.file_name if spec.history_motion else "none",
     )
 
     # ---- Check model ----
@@ -164,17 +164,17 @@ async def generate_timeline(
         # ---- Build history constraints ----
         history_info = None
         history_constraints = []
-        if spec.history_smplx:
-            fname = spec.history_smplx.file_name
+        if spec.history_motion:
+            fname = spec.history_motion.file_name
             if fname not in staged_files:
                 raise HTTPException(
                     status_code=400,
-                    detail=f"history_smplx references '{fname}' but it was not uploaded",
+                    detail=f"history_motion references '{fname}' but it was not uploaded",
                 )
             try:
                 history_result = service.build_history_constraints(
                     npz_path=staged_files[fname],
-                    num_history_frames=spec.history_smplx.num_frames,
+                    num_history_frames=spec.history_motion.num_frames,
                     coord_in=spec.coord_in,
                 )
                 history_constraints = history_result["constraints"]
@@ -185,7 +185,7 @@ async def generate_timeline(
                     "last_frame": history_result["last_frame"],
                 }
                 log.info("[%s] History: %d constraint frames, heading=%.3f, over-gen=%d",
-                         req_id, spec.history_smplx.num_frames,
+                         req_id, spec.history_motion.num_frames,
                          history_result["heading_angle"],
                          history_result["num_over_generate"])
             except Exception as e:
@@ -353,7 +353,7 @@ async def generate_timeline(
         headers={
             "Content-Disposition": f'attachment; filename="{filename}"',
             "X-Kimodo-Body2Hands": b2h_status,
-            "X-Kimodo-Meta": json.dumps({
+            "X-Motion-Meta": json.dumps({
                 k: v for k, v in result["meta"].items()
                 if k in ("total_frames", "fps", "elapsed_sec")
             }),
